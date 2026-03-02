@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+from utils.config import load_thresholds
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "db", "ops.sqlite")
 
@@ -60,7 +61,16 @@ fig = px.histogram(hist_df, x="slag_rate", nbins=30, title="出渣率分布")
 st.plotly_chart(fig, use_container_width=True)
 
 st.subheader("异常日（出渣率过高）")
-threshold = st.number_input("阈值（出渣率 > 阈值 列为异常）", value=0.75, step=0.05, min_value=0.0, max_value=2.0)
+##threshold = st.number_input("阈值（出渣率 > 阈值 列为异常）", value=0.75, step=0.05, min_value=0.0, max_value=2.0)
+th = load_thresholds()
+threshold = st.number_input(
+    "阈值（出渣率 > 阈值 列为异常）",
+    value=float(th.slag_rate_high),
+    step=0.05,
+    min_value=0.0,
+    max_value=2.0,
+)
+
 abn = (
     dfr.dropna(subset=["slag_rate"])
        .loc[dfr["slag_rate"] > threshold, ["date","incoming_ton","slag_total_ton","slag_rate"]]

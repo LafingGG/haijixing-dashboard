@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 import tempfile
 from etl.parse_excel import parse_workbook
+from utils.config import load_thresholds, save_thresholds, Thresholds
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "db", "ops.sqlite")
 
@@ -85,9 +86,10 @@ def build_import_report(df_new: pd.DataFrame) -> dict:
     df["slag_rate"] = df["slag_total_ton"] / df["incoming_ton"]
     df["water_intensity"] = df["water_m3"] / df["incoming_ton"]
 
-    # 规则阈值（先写死，下一步我们会把它做成可配置）
-    TH_SALGRATE = 0.75
-    TH_WATER_INT = 0.50  # m3/吨（你可按实际改）
+    from utils.config import load_thresholds
+    th = load_thresholds()
+    TH_SALGRATE = th.slag_rate_high
+    TH_WATER_INT = th.water_intensity_high
 
     # 异常规则（你可按实际再加）
     issues = []
@@ -144,6 +146,31 @@ uploaded = st.file_uploader(
     type=["xlsx"],
     accept_multiple_files=False,
 )
+
+th = load_thresholds()
+
+with st.expander("⚙️ 阈值设置（报警规则）", expanded=False):
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        slag_rate_high = st.number_input("出渣率阈值(吨/吨)", value=float(th.slag_rate_high), step=0.05)
+        elec_intensity_high = st.number_input("电耗强度阈值(kWh/吨)", value=float(th.elec_intensity_high), step=5.0)
+    with c2:
+        water_intensity_high = st.number_input("水耗强度阈值(m³/吨)", value=float(th.water_intensity_high), step=0.05)
+        water_m3_high = st.number_input("用水量绝对值阈值(m³)", value=float(th.water_m3_high), step=100.0)
+    with c3:
+        daily_elec_kwh_high = st.number_input("每日电耗绝对值阈值(kWh)", value=float(th.daily_elec_kwh_high), step=100.0)
+
+    if st.button("保存阈值", type="primary"):
+        save_thresholds(Thresholds(
+            slag_rate_high=slag_rate_high,
+            water_intensity_high=water_intensity_high,
+            elec_intensity_high=elec_intensity_high,
+            water_m3_high=water_m3_high,
+            daily_elec_kwh_high=daily_elec_kwh_high,
+        ))
+        st.success("阈值已保存，刷新后生效。")
+        st.rerun()
+
 
 if uploaded is not None:
     with st.spinner("正在解析并导入到本地数据库…"):
