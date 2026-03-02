@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 db/ops.sqlite
 .DS_Store
+test
