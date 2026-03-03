@@ -9,9 +9,7 @@ import pandas as pd
 from etl.parse_excel import parse_workbook
 
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "db", "ops.sqlite")
-DB_PATH = os.path.abspath(DB_PATH)
-
+DEFAULT_DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "db", "ops.sqlite"))
 
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS fact_daily_ops (
@@ -39,7 +37,6 @@ def upsert_df(conn: sqlite3.Connection, df: pd.DataFrame) -> None:
     df2 = df.copy()
     df2["date"] = df2["date"].dt.strftime("%Y-%m-%d")
 
-    # 简单策略：按 date 主键 upsert
     cols = list(df2.columns)
     placeholders = ",".join(["?"] * len(cols))
     col_list = ",".join(cols)
@@ -55,28 +52,46 @@ def upsert_df(conn: sqlite3.Connection, df: pd.DataFrame) -> None:
     conn.commit()
 
 
-def main():
-    if len(sys.argv) < 2:
-        print('用法: python -m etl.load_to_db "你的excel路径.xlsx"')
-        sys.exit(1)
-
-    xlsx_path = sys.argv[1]
+def load_xlsx_to_db(xlsx_path: str, db_path: str) -> tuple[int, str]:
+    """Parse Excel and upsert into sqlite db. Returns (rows, db_path)."""
     if not os.path.exists(xlsx_path):
-        print(f"找不到文件: {xlsx_path}")
-        sys.exit(1)
+        raise FileNotFoundError(f"找不到文件: {xlsx_path}")
 
     df = parse_workbook(xlsx_path)
     if df.empty:
-        print("未解析到数据（请检查 sheet/表头是否符合预期）")
-        sys.exit(2)
+        raise ValueError("未解析到数据（请检查 sheet/表头是否符合预期）")
 
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    db_path = os.path.abspath(db_path)
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+    conn = sqlite3.connect(db_path)
     conn.execute(CREATE_SQL)
     upsert_df(conn, df)
     conn.close()
 
-    print(f"导入完成：{len(df)} 行 -> {DB_PATH}")
+    return len(df), db_path
+
+
+def main():
+    if len(sys.argv) < 2:
+        print('用法: python -m etl.load_to_db "你的excel路径.xlsx" [--db /path/to/db.sqlite]')
+        sys.exit(1)
+
+    xlsx_path = sys.argv[1]
+    db_path = DEFAULT_DB_PATH
+
+    # optional: allow overriding db path
+    if "--db" in sys.argv:
+        i = sys.argv.index("--db")
+        if i + 1 < len(sys.argv):
+            db_path = sys.argv[i + 1]
+
+    try:
+        n, p = load_xlsx_to_db(xlsx_path, db_path)
+        print(f"导入完成：{n} 行 -> {p}")
+    except Exception as e:
+        print(str(e))
+        sys.exit(2)
 
 
 if __name__ == "__main__":
