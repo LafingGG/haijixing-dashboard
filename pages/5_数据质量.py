@@ -20,34 +20,37 @@ from utils.paths import get_db_path
 
 DB_PATH = get_db_path()
 
-# st.sidebar.markdown("### 🔎 Debug")
-# st.sidebar.caption(f"DB_PATH: `{DB_PATH}`")
-# st.sidebar.caption(f"exists: `{os.path.exists(DB_PATH)}`")
-# if os.path.exists(DB_PATH):
-#     st.sidebar.caption(f"size: `{os.path.getsize(DB_PATH)} bytes`")
+DEBUG = bool(st.secrets.get("DEBUG", False))
 
-# @st.cache_data(ttl=300)
-# def _debug_read_one_row(db_path: str):
-#     conn = sqlite3.connect(db_path)
-#     df = pd.read_sql_query("SELECT * FROM fact_daily_ops ORDER BY date LIMIT 1", conn, parse_dates=["date"])
-#     conn.close()
-#     return list(df.columns), df.to_dict(orient="records")[0]
+if DEBUG:
+    st.sidebar.markdown("### 🔎 Debug")
+    st.sidebar.caption(f"DB_PATH: `{DB_PATH}`")
+    st.sidebar.caption(f"exists: `{os.path.exists(DB_PATH)}`")
+    if os.path.exists(DB_PATH):
+        st.sidebar.caption(f"size: `{os.path.getsize(DB_PATH)} bytes`")
 
-# if os.path.exists(DB_PATH):
-#     try:
-#         cols, row0 = _debug_read_one_row(DB_PATH)
-#         st.sidebar.caption(f"cols: `{len(cols)}`")
-#         with st.sidebar.expander("columns"):
-#             st.write(cols)
-#         with st.sidebar.expander("row[0]"):
-#             st.write(row0)
-#     except Exception as e:
-#         st.sidebar.error("Read DB failed:")
-#         st.sidebar.exception(e)
-#         st.stop()
-# else:
-#     st.sidebar.error("DB file not found. Stop.")
-#     st.stop()
+    @st.cache_data(ttl=300)
+    def _debug_read_one_row(db_path: str):
+        conn = sqlite3.connect(db_path)
+        df = pd.read_sql_query("SELECT * FROM fact_daily_ops ORDER BY date LIMIT 1", conn, parse_dates=["date"])
+        conn.close()
+        return list(df.columns), df.to_dict(orient="records")[0]
+
+    if os.path.exists(DB_PATH):
+        try:
+            cols, row0 = _debug_read_one_row(DB_PATH)
+            st.sidebar.caption(f"cols: `{len(cols)}`")
+            with st.sidebar.expander("columns"):
+                st.write(cols)
+            with st.sidebar.expander("row[0]"):
+                st.write(row0)
+        except Exception as e:
+            st.sidebar.error("Read DB failed:")
+            st.sidebar.exception(e)
+            st.stop()
+    else:
+        st.sidebar.error("DB file not found. Stop.")
+        st.stop()
 
 @st.cache_data(ttl=5)
 def load_data() -> pd.DataFrame:
