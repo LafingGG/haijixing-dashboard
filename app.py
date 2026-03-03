@@ -9,7 +9,8 @@ import tempfile
 from etl.parse_excel import parse_workbook
 from utils.config import load_thresholds, save_thresholds, Thresholds
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "db", "ops.sqlite")
+#DB_PATH = os.path.join(os.path.dirname(__file__), "db", "ops.sqlite")
+DB_PATH = "data/project.db"
 
 from utils.definitions import DEFINITIONS_VERSION
 
