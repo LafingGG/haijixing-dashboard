@@ -3,72 +3,58 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import tempfile
+from typing import Dict, Any, Tuple
+
 import pandas as pd
 import streamlit as st
-import tempfile
+
 from etl.parse_excel import parse_workbook
+from etl.load_to_db import load_xlsx_to_db
 from utils.config import load_thresholds, save_thresholds, Thresholds
-
-#DB_PATH = os.path.join(os.path.dirname(__file__), "db", "ops.sqlite")
-DB_PATH = "data/project.db"
-
+from utils.paths import get_db_path
 from utils.definitions import DEFINITIONS_VERSION
 
-@st.cache_data(ttl=5)
 
-def upsert_df_to_sqlite(db_path: str, df: pd.DataFrame) -> int:
-    """把 parse_workbook() 的结果 upsert 到 SQLite。返回写入行数。"""
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+DB_PATH = get_db_path()
 
-    create_sql = """
-    CREATE TABLE IF NOT EXISTS fact_daily_ops (
-        date TEXT PRIMARY KEY,
-        incoming_trips REAL,
-        incoming_ton REAL,
-        slag_trips REAL,
-        slag_ton REAL,
-        slag_total_ton REAL,
-        slurry_m3 REAL,
-        water_meter_m3 REAL,
-        water_m3 REAL,
-        elec_meter_x1e3kwh REAL,
-        elec_meter_kwh REAL,
-        proj_flow_m3 REAL,
-        to_wwtp_m3 REAL,
-        wwtp_flow_m3 REAL,
-        arrive_wwtp_m3 REAL,
-        source_sheet TEXT
-    );
-    """
 
-    df2 = df.copy()
-    df2["date"] = df2["date"].dt.strftime("%Y-%m-%d")
-
-    cols = list(df2.columns)
-    placeholders = ",".join(["?"] * len(cols))
-    col_list = ",".join(cols)
-    update_list = ",".join([f"{c}=excluded.{c}" for c in cols if c != "date"])
-
-    sql = f"""
-    INSERT INTO fact_daily_ops ({col_list})
-    VALUES ({placeholders})
-    ON CONFLICT(date) DO UPDATE SET {update_list};
-    """
-
+# -------------------------
+# Data access (read-only)
+# -------------------------
+@st.cache_data(ttl=60)
+def load_data(db_path: str) -> pd.DataFrame:
+    if not os.path.exists(db_path):
+        return pd.DataFrame()
     conn = sqlite3.connect(db_path)
-    conn.execute(create_sql)
-    conn.executemany(sql, df2.itertuples(index=False, name=None))
-    conn.commit()
+    df = pd.read_sql_query(
+        "SELECT * FROM fact_daily_ops ORDER BY date",
+        conn,
+        parse_dates=["date"],
+    )
     conn.close()
+    return df
 
-    return len(df2)
 
-def build_import_report(df_new: pd.DataFrame) -> dict:
+def get_db_stats(db_path: str) -> Tuple[int, str | None]:
+    """Step4: 校验入库是否真的生效（行数 + 最新日期）"""
+    if not os.path.exists(db_path):
+        return 0, None
+    conn = sqlite3.connect(db_path)
+    cnt = conn.execute("SELECT COUNT(*) FROM fact_daily_ops").fetchone()[0]
+    latest = conn.execute("SELECT MAX(date) FROM fact_daily_ops").fetchone()[0]
+    conn.close()
+    return int(cnt), latest
+
+
+# -------------------------
+# Import report (quality)
+# -------------------------
+def build_import_report(df_new: pd.DataFrame) -> Dict[str, Any]:
     """
-    根据 parse_workbook() 的结果生成导入质量报告（不依赖改 ETL）。
-    返回 dict，便于页面展示。
+    根据 parse_workbook() 的结果生成导入质量报告。
     """
-    report = {}
+    report: Dict[str, Any] = {}
 
     df = df_new.copy().sort_values("date")
     report["rows"] = int(len(df))
@@ -83,16 +69,14 @@ def build_import_report(df_new: pd.DataFrame) -> dict:
     miss = (df.isna().mean() * 100).sort_values(ascending=False)
     report["missing_top"] = miss.head(10)
 
-    # 派生指标
-    df["slag_rate"] = df["slag_total_ton"] / df["incoming_ton"]
-    df["water_intensity"] = df["water_m3"] / df["incoming_ton"]
+    # 派生指标（注意除零）
+    df["slag_rate"] = df["slag_total_ton"] / df["incoming_ton"].replace(0, pd.NA)
+    df["water_intensity"] = df["water_m3"] / df["incoming_ton"].replace(0, pd.NA)
 
-    from utils.config import load_thresholds
     th = load_thresholds()
     TH_SALGRATE = th.slag_rate_high
     TH_WATER_INT = th.water_intensity_high
 
-    # 异常规则（你可按实际再加）
     issues = []
     for _, r in df.iterrows():
         day = r["date"].date()
@@ -100,7 +84,7 @@ def build_import_report(df_new: pd.DataFrame) -> dict:
         # 来料异常
         if pd.isna(r["incoming_ton"]) or r["incoming_ton"] <= 0:
             issues.append((day, "来料吨为空/<=0"))
-            continue  # 没来料时后面的强度就不算了
+            continue
 
         # 出渣异常
         if pd.isna(r["slag_total_ton"]) or r["slag_total_ton"] <= 0:
@@ -118,38 +102,125 @@ def build_import_report(df_new: pd.DataFrame) -> dict:
             if pd.notna(r["water_intensity"]) and r["water_intensity"] > TH_WATER_INT:
                 issues.append((day, f"水耗强度偏高（>{TH_WATER_INT} m³/吨）"))
 
-    # 聚合异常
     if issues:
         df_issues = pd.DataFrame(issues, columns=["date", "issue"])
-        df_issues = df_issues.groupby("date")["issue"].apply(lambda x: "；".join(sorted(set(x)))).reset_index()
+        df_issues = (
+            df_issues.groupby("date")["issue"]
+            .apply(lambda x: "；".join(sorted(set(x))))
+            .reset_index()
+        )
     else:
         df_issues = pd.DataFrame(columns=["date", "issue"])
 
     report["issues_df"] = df_issues
     return report
 
-def load_data() -> pd.DataFrame:
-    if not os.path.exists(DB_PATH):
-        return pd.DataFrame()
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM fact_daily_ops ORDER BY date", conn, parse_dates=["date"])
-    conn.close()
-    return df
+
+def import_excel_to_db(uploaded_file, db_path: str) -> Tuple[int, str, Dict[str, Any]]:
+    """
+    上传 Excel -> 解析 -> 质量报告 -> 入库（upsert） -> 返回 (rows, db_path, report)
+    """
+    # 1) 保存到临时文件（parse_workbook / ETL 都需要路径）
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        tmp.write(uploaded_file.getbuffer())
+        tmp_path = tmp.name
+
+    try:
+        # 2) 先解析做质量报告
+        df_new = parse_workbook(tmp_path)
+        if df_new.empty:
+            raise ValueError("没有解析到数据：请检查 sheet/表头行是否符合当前解析规则。")
+
+        report = build_import_report(df_new)
+
+        # 3) 再调用 ETL 入库（统一用同一个 db_path）
+        n, p = load_xlsx_to_db(tmp_path, db_path)
+
+        return n, p, report
+
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
 
+# -------------------------
+# UI
+# -------------------------
 st.set_page_config(page_title="海吉星果蔬项目 | 本地运营看板", layout="wide")
 st.title("海吉星果蔬项目 · 本地运营看板")
 
+# 可选：在 sidebar 显示当前 DB 路径（便于排障，后续你可删掉）
+with st.sidebar:
+    st.markdown("### 🗄️ 数据库")
+    st.caption(f"DB_PATH: `{DB_PATH}`")
+    st.caption(f"exists: `{os.path.exists(DB_PATH)}`")
+    if os.path.exists(DB_PATH):
+        st.caption(f"size: `{os.path.getsize(DB_PATH)} bytes`")
+
 st.subheader("导入 Excel（上传后自动入库）")
+uploaded = st.file_uploader("选择你的月度运营 Excel（.xlsx）", type=["xlsx"])
 
-uploaded = st.file_uploader(
-    "选择你的月度运营 Excel（.xlsx）",
-    type=["xlsx"],
-    accept_multiple_files=False,
-)
+# Step4：入库前先显示当前 DB 状态（不依赖缓存）
+try:
+    if os.path.exists(DB_PATH):
+        cnt0, latest0 = get_db_stats(DB_PATH)
+        st.caption(f"当前库：行数 {cnt0}，最新日期 {latest0}")
+except Exception:
+    # 如果表还没建，先不显示
+    pass
 
+if uploaded is not None:
+    if st.button("开始导入到数据库", type="primary"):
+        try:
+            with st.spinner("正在解析 → 生成质量报告 → 入库..."):
+                n, p, report = import_excel_to_db(uploaded, DB_PATH)
+
+            st.success(f"导入完成：{n} 行 → {p}")
+            st.success(f"解析覆盖：{report['rows']} 天，{report['date_min']} ~ {report['date_max']}")
+
+            if report["dup_dates"]:
+                st.warning(
+                    "检测到重复日期（可能重复录入）："
+                    + ", ".join(map(str, report["dup_dates"][:10]))
+                    + (" ..." if len(report["dup_dates"]) > 10 else "")
+                )
+
+            with st.expander("查看导入质量报告", expanded=True):
+                c1, c2, c3 = st.columns(3)
+                c1.metric("解析天数", report["rows"])
+                c2.metric("开始日期", str(report["date_min"]))
+                c3.metric("结束日期", str(report["date_max"]))
+
+                st.markdown("**字段缺失率 Top 10（%）**")
+                st.dataframe(report["missing_top"].to_frame("missing_%"), use_container_width=True)
+
+                st.markdown("**异常日清单**")
+                st.dataframe(report["issues_df"], use_container_width=True, hide_index=True)
+
+                csv_issues = report["issues_df"].to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "下载异常日清单 CSV",
+                    data=csv_issues,
+                    file_name=f"import_issues_{DEFINITIONS_VERSION}.csv",
+                    mime="text/csv",
+                )
+
+            # Step4：入库后校验
+            cnt1, latest1 = get_db_stats(DB_PATH)
+            st.info(f"入库校验：当前行数 {cnt1}，最新日期 {latest1}")
+
+            # 关键：清缓存并刷新，让其它页面立刻读到新数据
+            st.cache_data.clear()
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"导入失败：{e}")
+
+
+# 阈值设置
 th = load_thresholds()
-
 with st.expander("⚙️ 阈值设置（报警规则）", expanded=False):
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -173,66 +244,13 @@ with st.expander("⚙️ 阈值设置（报警规则）", expanded=False):
         st.rerun()
 
 
-if uploaded is not None:
-    with st.spinner("正在解析并导入到本地数据库…"):
-        # 写入临时文件（parse_workbook 需要文件路径）
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-            tmp.write(uploaded.getbuffer())
-            tmp_path = tmp.name
-
-        try:
-            df_new = parse_workbook(tmp_path)
-            if df_new.empty:
-                st.error("没有解析到数据：请检查 sheet/表头行是否符合当前解析规则。")
-            else:
-                # ✅ 先生成报告并展示
-                report = build_import_report(df_new)
-
-                st.success(
-                    f"解析成功：{report['rows']} 天，覆盖 {report['date_min']} ~ {report['date_max']}"
-                )
-
-                if report["dup_dates"]:
-                    st.warning(f"检测到重复日期（可能重复录入）：{', '.join(map(str, report['dup_dates'][:10]))}"
-                            + (" ..." if len(report["dup_dates"]) > 10 else ""))
-
-                with st.expander("查看导入质量报告", expanded=True):
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("解析天数", report["rows"])
-                    c2.metric("开始日期", str(report["date_min"]))
-                    c3.metric("结束日期", str(report["date_max"]))
-
-                    st.markdown("**字段缺失率 Top 10（%）**")
-                    st.dataframe(report["missing_top"].to_frame("missing_%"), use_container_width=True)
-
-                    st.markdown("**异常日清单**")
-                    st.dataframe(report["issues_df"], use_container_width=True, hide_index=True)
-
-                    csv_issues = report["issues_df"].to_csv(index=False).encode("utf-8-sig")
-                    st.download_button(
-                        "下载异常日清单 CSV",
-                        data=csv_issues,
-                        file_name=f"import_issues_{DEFINITIONS_VERSION}.csv",
-                        mime="text/csv",
-                    )
-                # ✅ 再写入数据库
-                n = upsert_df_to_sqlite(DB_PATH, df_new)
-
-                st.cache_data.clear()
-                st.success(f"导入完成：写入/更新 {n} 行数据。")
-                st.rerun()
-        finally:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-
 st.divider()
 
-df = load_data()
+# 主数据加载与导航
+df = load_data(DB_PATH)
 
 if df.empty:
-    st.warning("还没有数据。请先运行：`python -m etl.load_to_db \"你的excel路径.xlsx\"` 导入数据。")
+    st.warning("还没有数据。请上传 Excel 导入数据。")
     st.stop()
 
 st.caption(f"数据范围：{df['date'].min().date()} ~ {df['date'].max().date()}（共 {len(df)} 天）")
@@ -240,10 +258,8 @@ st.caption(f"数据范围：{df['date'].min().date()} ~ {df['date'].max().date()
 st.page_link("pages/1_总览.py", label="➡️ 打开：总览", icon="📊")
 st.page_link("pages/2_物料平衡.py", label="➡️ 打开：物料平衡", icon="🧪")
 st.page_link("pages/3_水电能耗.py", label="➡️ 打开：水电能耗", icon="⚡")
-##st.page_link("pages/4_去水厂核对.py", label="➡️ 打开：去水厂核对", icon="🏭")
 st.page_link("pages/5_数据质量.py", label="➡️ 打开：数据质量", icon="🧹")
 
 st.divider()
 st.subheader("快速预览（最近 14 天）")
-df14 = df.tail(14).copy()
-st.dataframe(df14, use_container_width=True, hide_index=True)
+st.dataframe(df.tail(14), use_container_width=True, hide_index=True)
