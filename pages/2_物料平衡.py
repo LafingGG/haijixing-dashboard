@@ -11,16 +11,16 @@ from utils.paths import get_db_path
 DB_PATH = get_db_path()
 
 
-import os
-import streamlit as st
-import sqlite3
-import pandas as pd
+def _as_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-from utils.paths import get_db_path
+DEBUG = _as_bool(st.secrets.get("DEBUG", False))
 
-DB_PATH = get_db_path()
-
-DEBUG = bool(st.secrets.get("DEBUG", False))
+st.sidebar.caption(f"DEBUG(secrets) raw: `{st.secrets.get('DEBUG', None)}`")
 
 if DEBUG:
     st.sidebar.markdown("### 🔎 Debug")

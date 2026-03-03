@@ -151,7 +151,16 @@ def import_excel_to_db(uploaded_file, db_path: str) -> Tuple[int, str, Dict[str,
 st.set_page_config(page_title="海吉星果蔬项目 | 本地运营看板", layout="wide")
 st.title("海吉星果蔬项目 · 本地运营看板")
 
-DEBUG = bool(st.secrets.get("DEBUG", False))
+def _as_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+DEBUG = _as_bool(st.secrets.get("DEBUG", False))
+
+st.sidebar.caption(f"DEBUG(secrets) raw: `{st.secrets.get('DEBUG', None)}`")
 
 if DEBUG:
     # 可选：在 sidebar 显示当前 DB 路径（便于排障，后续你可删掉）

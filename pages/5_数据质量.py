@@ -1,26 +1,22 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-
 import os, sqlite3
 import pandas as pd
 import streamlit as st
-
 from utils.definitions import DEFINITIONS_MD, DEFINITIONS_VERSION
-
 from utils.paths import get_db_path
 DB_PATH = get_db_path()
 
+def _as_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-import os
-import streamlit as st
-import sqlite3
-import pandas as pd
+DEBUG = _as_bool(st.secrets.get("DEBUG", False))
 
-from utils.paths import get_db_path
-
-DB_PATH = get_db_path()
-
-DEBUG = bool(st.secrets.get("DEBUG", False))
+st.sidebar.caption(f"DEBUG(secrets) raw: `{st.secrets.get('DEBUG', None)}`")
 
 if DEBUG:
     st.sidebar.markdown("### 🔎 Debug")
