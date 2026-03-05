@@ -12,7 +12,6 @@ from utils.definitions import DEFINITIONS_MD, DEFINITIONS_VERSION
 from utils.paths import get_db_path
 DB_PATH = get_db_path()
 
-
 def _as_bool(v) -> bool:
     if isinstance(v, bool):
         return v
