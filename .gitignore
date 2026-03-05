@@ -4,3 +4,4 @@ __pycache__/
 db/ops.sqlite
 .DS_Store
 test
+.streamlit/secrets.toml
