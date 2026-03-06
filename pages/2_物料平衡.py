@@ -8,9 +8,11 @@ import streamlit as st
 import plotly.express as px
 from utils.config import load_thresholds
 from utils.paths import get_db_path
+from utils.bootstrap import bootstrap_page
+from utils.snapshot import get_active_snapshot_id
 DB_PATH = get_db_path()
-
-
+user = bootstrap_page(DB_PATH)
+ACTIVE_SNAPSHOT_ID = get_active_snapshot_id(DB_PATH)
 def _as_bool(v) -> bool:
     if isinstance(v, bool):
         return v
@@ -32,7 +34,8 @@ if DEBUG:
     @st.cache_data(ttl=300)
     def _debug_read_one_row(db_path: str):
         conn = sqlite3.connect(db_path)
-        df = pd.read_sql_query("SELECT * FROM fact_daily_ops ORDER BY date LIMIT 1", conn, parse_dates=["date"])
+        df = pd.read_sql_query("SELECT * FROM fact_daily_ops WHERE snapshot_id=? ORDER BY date LIMIT 1", conn,
+        params=(ACTIVE_SNAPSHOT_ID,), parse_dates=["date"])
         conn.close()
         return list(df.columns), df.to_dict(orient="records")[0]
 
@@ -55,7 +58,8 @@ if DEBUG:
 @st.cache_data(ttl=5)
 def load_data() -> pd.DataFrame:
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM fact_daily_ops ORDER BY date", conn, parse_dates=["date"])
+    df = pd.read_sql_query("SELECT * FROM fact_daily_ops WHERE snapshot_id=? ORDER BY date", conn,
+        params=(ACTIVE_SNAPSHOT_ID,), parse_dates=["date"])
     conn.close()
     return df
 
