@@ -91,6 +91,7 @@ def ensure_snapshot_schema(db_path: str) -> None:
         exists = cur.fetchone() is not None
         if not exists:
             _create_fact_daily_ops_v2(conn)
+            conn.execute("ALTER TABLE fact_daily_ops_v2 RENAME TO fact_daily_ops")
             _ensure_settings(conn)
             conn.commit()
             return
