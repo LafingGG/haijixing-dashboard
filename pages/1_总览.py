@@ -13,6 +13,11 @@ from utils.definitions import DEFINITIONS_MD, DEFINITIONS_VERSION
 from utils.paths import get_db_path
 from utils.bootstrap import bootstrap_page
 from utils.snapshot import get_active_snapshot_id
+
+import plotly.graph_objects as go
+from utils.ops_kpi import get_latest_ops_kpis, get_recent_ops_trend, classify_data_freshness
+from utils.device_summary import get_home_device_status
+
 DB_PATH = get_db_path()
 user = bootstrap_page(DB_PATH)
 ACTIVE_SNAPSHOT_ID = get_active_snapshot_id(DB_PATH)
@@ -191,6 +196,93 @@ section[data-testid="stSidebar"] span {
 }
 </style>
 """, unsafe_allow_html=True)
+
+st.markdown("## 运行状态概览")
+
+latest_kpi = get_latest_ops_kpis(DB_PATH)
+
+if not latest_kpi:
+    st.warning("当前没有可展示的日运营数据。")
+else:
+    c1, c2, c3 = st.columns(3)
+
+    incoming_ton = latest_kpi["incoming_ton"]
+    slag_ratio = latest_kpi["slag_ratio"]
+    latest_date = latest_kpi["date"]
+    days_lag = latest_kpi["days_lag"]
+    device_info = get_home_device_status(DB_PATH)
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "最近处理量",
+        f"{incoming_ton:,.1f} 吨" if incoming_ton is not None else "-"
+    )
+
+    c2.metric(
+        "最近出渣率",
+        f"{slag_ratio * 100:.1f}%" if slag_ratio is not None else "-"
+    )
+
+    c3.metric(
+        "设备状态",
+        device_info["label"]
+    )
+
+    c4.metric(
+        "数据日期",
+        latest_date.strftime("%Y-%m-%d") if latest_date is not None and pd.notna(latest_date) else "-"
+    )
+
+    st.caption(f"设备状态说明：{device_info['detail']}")
+
+    freshness = classify_data_freshness(days_lag)
+    if days_lag is None:
+        st.info("数据新鲜度：未知")
+    elif days_lag <= 1:
+        st.success(f"数据新鲜度：{freshness}（延迟 {days_lag} 天）")
+    elif days_lag <= 3:
+        st.warning(f"数据新鲜度：{freshness}（延迟 {days_lag} 天）")
+    else:
+        st.error(f"数据新鲜度：{freshness}（延迟 {days_lag} 天）")
+
+st.markdown("## 近 7 天运行趋势")
+
+trend_df = get_recent_ops_trend(DB_PATH, days=7)
+
+if trend_df.empty:
+    st.info("暂无近 7 天运营趋势数据。")
+else:
+    fig = go.Figure()
+
+    fig.add_bar(
+        x=trend_df["date"].dt.strftime("%Y-%m-%d"),
+        y=trend_df["incoming_ton"],
+        name="处理量（吨）",
+    )
+
+    fig.add_scatter(
+        x=trend_df["date"].dt.strftime("%Y-%m-%d"),
+        y=(trend_df["slag_ratio"] * 100),
+        mode="lines+markers",
+        name="出渣率（%）",
+        yaxis="y2",
+    )
+
+    fig.update_layout(
+        height=420,
+        margin=dict(l=10, r=10, t=40, b=10),
+        xaxis=dict(title="日期"),
+        yaxis=dict(title="处理量（吨）"),
+        yaxis2=dict(
+            title="出渣率（%）",
+            overlaying="y",
+            side="right",
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
 
 df = load_data()
 if df.empty:
