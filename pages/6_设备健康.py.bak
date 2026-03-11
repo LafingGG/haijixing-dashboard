@@ -8,7 +8,6 @@ from datetime import date
 from io import BytesIO
 from typing import List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -160,60 +159,6 @@ def _infer_system_from_eid(eid: str) -> str:
     return "其他"
 
 
-def _parse_duration_to_hours(x) -> float:
-    """
-    把常见停机时长写法统一转成小时。
-    支持：
-    - 2
-    - 2.5
-    - 2小时
-    - 2.5小时
-    - 120分钟
-    - 1小时30分
-    - 1h / 1.5h
-    """
-    if pd.isna(x):
-        return np.nan
-
-    if isinstance(x, (int, float, np.number)):
-        return float(x)
-
-    s = str(x).strip()
-    if not s:
-        return np.nan
-
-    try:
-        return float(s)
-    except Exception:
-        pass
-
-    m = re.search(r"(\d+(?:\.\d+)?)\s*小时", s)
-    if m:
-        hours = float(m.group(1))
-        m2 = re.search(r"(\d+(?:\.\d+)?)\s*分", s)
-        if m2:
-            hours += float(m2.group(1)) / 60.0
-        return hours
-
-    m = re.search(r"(\d+(?:\.\d+)?)\s*h(?:ours?)?$", s, re.I)
-    if m:
-        return float(m.group(1))
-
-    m = re.search(r"(\d+(?:\.\d+)?)\s*分钟", s)
-    if m:
-        return float(m.group(1)) / 60.0
-
-    m = re.search(r"(\d+(?:\.\d+)?)\s*分$", s)
-    if m:
-        return float(m.group(1)) / 60.0
-
-    m = re.search(r"(\d+)\s*小时\s*(\d+)\s*分", s)
-    if m:
-        return float(m.group(1)) + float(m.group(2)) / 60.0
-
-    return np.nan
-
-
 # ============================================================
 # Loaders: equipment status + fault events
 # ============================================================
@@ -257,36 +202,11 @@ def _normalize_equipment_df(df: pd.DataFrame, default_system: str) -> pd.DataFra
 
 
 def _calc_downtime_hours(df: pd.DataFrame) -> pd.Series:
-    """
-    更稳的停机时长计算逻辑：
-    1. 优先使用现成的时长字段，并支持“2小时/120分钟/1h/1小时30分”等格式
-    2. 若无现成字段，再尝试用开始/结束时间差计算
-    3. 算不出来返回 NaN，而不是 0
-    """
-    if df is None or df.empty:
-        return pd.Series(dtype="float64")
-
-    out = pd.Series(np.nan, index=df.index, dtype="float64")
-
-    duration_candidates = [
-        "停机时长（小时）",
-        "停机时长(小时)",
-        "停机时长",
-        "停机小时",
-        "停机时长（h）",
-        "时长（小时）",
-        "时长(小时)",
-        "时长",
-        "维修时长",
-        "duration_hours",
-        "downtime_hours",
-        "duration",
-    ]
-
-    existing_duration_cols = [c for c in duration_candidates if c in df.columns]
-    for col in existing_duration_cols:
-        parsed = df[col].apply(_parse_duration_to_hours)
-        out = out.fillna(parsed)
+    for col in ["停机时长（小时）", "停机时长", "停机时长(小时)", "停机小时", "停机时长（h）"]:
+        if col in df.columns:
+            h = pd.to_numeric(df[col], errors="coerce")
+            if h.notna().any():
+                return h
 
     start_col = None
     end_col = None
@@ -300,13 +220,12 @@ def _calc_downtime_hours(df: pd.DataFrame) -> pd.Series:
             break
 
     if start_col and end_col:
-        start_dt = _to_dt_with_date(df["日期"], df[start_col])
-        end_dt = _to_dt_with_date(df["日期"], df[end_col])
-        delta = (end_dt - start_dt).dt.total_seconds() / 3600.0
-        delta = delta.where((delta >= 0) & (delta <= 24 * 30), np.nan)
-        out = out.fillna(delta)
+        stt = _to_dt(df[start_col])
+        edt = _to_dt(df[end_col])
+        delta = (edt - stt).dt.total_seconds() / 3600.0
+        return delta.where(delta >= 0)
 
-    return out
+    return pd.Series([pd.NA] * len(df), index=df.index, dtype="float64")
 
 
 def _normalize_fault_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -346,6 +265,8 @@ def _normalize_fault_df(df: pd.DataFrame) -> pd.DataFrame:
     cat_col = _find_col(df, ["异常类别（下拉选择）", "异常类别", "故障类别", "类别"])
     df["异常类别"] = df[cat_col] if cat_col else ""
 
+    df["停机小时"] = _calc_downtime_hours(df)
+
     start_col = _find_col(df, ["故障开始时间", "开始时间", "停机开始时间"])
     end_col = _find_col(df, ["故障结束时间", "结束时间", "停机结束时间"])
 
@@ -358,8 +279,6 @@ def _normalize_fault_df(df: pd.DataFrame) -> pd.DataFrame:
         df["_end_dt"] = _to_dt_with_date(df["日期"], df[end_col])
     else:
         df["_end_dt"] = pd.NaT
-
-    df["停机小时"] = _calc_downtime_hours(df)
 
     return df
 
@@ -1153,20 +1072,15 @@ else:
     total_events = int(len(dff))
     unique_devices = int(dff["设备id"].nunique()) if "设备id" in dff.columns else 0
 
-    stop_mask = dff["是否停机"].astype(str).str.contains("是", na=False) if "是否停机" in dff.columns else pd.Series([False] * len(dff), index=dff.index)
+    stop_mask = dff["是否停机"].astype(str).str.contains("是", na=False) if "是否停机" in dff.columns else pd.Series([False] * len(dff))
     stop_df = dff[stop_mask].copy()
+    downtime_hours_sum = float(pd.to_numeric(stop_df["停机小时"], errors="coerce").fillna(0).sum()) if "停机小时" in stop_df.columns else 0.0
 
-    # 只汇总真正算得出时长的停机记录
-    downtime_hours_sum = (
-        float(pd.to_numeric(stop_df["停机小时"], errors="coerce").dropna().sum())
-        if "停机小时" in stop_df.columns else 0.0
-    )
-
-    # 完整率：停机记录中，可计算时长的占比
-    if len(stop_df) > 0 and "停机小时" in stop_df.columns:
-        completeness = float(pd.to_numeric(stop_df["停机小时"], errors="coerce").notna().mean())
+    if len(stop_df) > 0:
+        complete_cnt = int(((stop_df["_start_dt"].notna()) & (stop_df["_end_dt"].notna())).sum())
+        completeness = complete_cnt / len(stop_df)
     else:
-        completeness = 0.0
+        completeness = 1.0
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("本期异常次数", f"{total_events}")
@@ -1190,7 +1104,7 @@ else:
 
     grp = dff.groupby(["设备id", "设备名称", "系统"], dropna=False).agg(
         异常次数=("日期", "count"),
-        停机总时长小时=("停机小时", lambda x: float(pd.to_numeric(x, errors="coerce").dropna().sum())),
+        停机总时长小时=("停机小时", lambda x: float(pd.to_numeric(x, errors="coerce").fillna(0).sum())),
         最近一次异常=("日期", "max"),
     ).reset_index()
 
