@@ -1,38 +1,92 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os
-import sqlite3
 import pandas as pd
 import streamlit as st
 
-from utils.definitions import DEFINITIONS_MD, DEFINITIONS_VERSION
-from utils.paths import get_db_path
+st.set_page_config(page_title="数据质量", page_icon="🧪", layout="wide")
+
 from utils.bootstrap import bootstrap_page
+from utils.paths import get_db_path
 from utils.snapshot import get_active_snapshot_id
-from utils.guards import require_admin
+from utils.data_access import load_daily_ops_data
 
-DB_PATH = get_db_path()
-user = bootstrap_page(DB_PATH)
-require_admin(user)  # ✅ v1.4-stable: viewer 直接拦截
+bootstrap_page("数据质量")
 
-ACTIVE_SNAPSHOT_ID = get_active_snapshot_id(DB_PATH)
-
-
-def _as_bool(v) -> bool:
-    if isinstance(v, bool):
-        return v
-    if v is None:
-        return False
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-st.set_page_config(page_title="数据质量", layout="wide")
 st.title("🧪 数据质量")
-st.caption(f"Definitions: {DEFINITIONS_VERSION}")
+st.caption("用于检查当前快照下运行数据的完整性、连续性和异常值。")
 
-# ---- 以下保留你原来的页面逻辑（如果你原文件后面还有内容，请保持不变） ----
-# 这里我不重写你现有的统计细节，避免破坏现有行为。
-# 你把 require_admin(user) 加进去后，厂长就进不来了。
-#
-# 如果你希望我把本页也做成“更稳定的异常兜底”，把你原文件剩余部分也贴出来，我再给你整页可替换版。
+db_path = get_db_path()
+snapshot_id = get_active_snapshot_id(db_path)
+df = load_daily_ops_data(db_path, snapshot_id=snapshot_id)
+
+if df.empty:
+    st.warning("当前快照下暂无运行数据。")
+    st.stop()
+
+df = df.copy()
+df["date"] = pd.to_datetime(df["date"], errors="coerce")
+df = df[df["date"].notna()].sort_values("date")
+
+st.markdown("### 基本情况")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("记录数", len(df))
+c2.metric("开始日期", str(df["date"].min().date()))
+c3.metric("结束日期", str(df["date"].max().date()))
+c4.metric("覆盖天数", df["date"].nunique())
+
+st.markdown("### 缺失值检查")
+key_cols = [c for c in ["incoming_ton", "slag_ton", "slag_total_ton", "water_m3", "elec_meter_kwh"] if c in df.columns]
+missing_rows = []
+for col in key_cols:
+    missing_rows.append({
+        "字段": col,
+        "缺失数": int(df[col].isna().sum()),
+        "缺失率": df[col].isna().mean(),
+    })
+missing_df = pd.DataFrame(missing_rows)
+st.dataframe(missing_df, use_container_width=True, hide_index=True)
+
+st.markdown("### 日期连续性检查")
+full_range = pd.date_range(df["date"].min(), df["date"].max(), freq="D")
+missing_dates = sorted(set(full_range.date) - set(df["date"].dt.date))
+if missing_dates:
+    st.warning(f"存在 {len(missing_dates)} 个缺失日期。")
+    st.dataframe(pd.DataFrame({"缺失日期": missing_dates}), use_container_width=True, hide_index=True)
+else:
+    st.success("日期连续性正常。")
+
+st.markdown("### 异常值检查")
+issues = []
+
+if "incoming_ton" in df.columns:
+    bad = df[df["incoming_ton"] < 0]
+    if not bad.empty:
+        issues.append(("incoming_ton < 0", bad[["date", "incoming_ton"]]))
+
+if "slag_total_ton" in df.columns:
+    bad = df[df["slag_total_ton"] < 0]
+    if not bad.empty:
+        issues.append(("slag_total_ton < 0", bad[["date", "slag_total_ton"]]))
+
+if "water_m3" in df.columns:
+    bad = df[df["water_m3"] < 0]
+    if not bad.empty:
+        issues.append(("water_m3 < 0", bad[["date", "water_m3"]]))
+
+if "incoming_ton" in df.columns and "slag_total_ton" in df.columns:
+    tmp = df.copy()
+    tmp["slag_rate"] = tmp["slag_total_ton"] / tmp["incoming_ton"]
+    bad = tmp[(tmp["incoming_ton"] > 0) & (tmp["slag_rate"] > 1.0)]
+    if not bad.empty:
+        issues.append(("slag_rate > 1", bad[["date", "incoming_ton", "slag_total_ton", "slag_rate"]]))
+
+if not issues:
+    st.success("未发现明显异常值。")
+else:
+    for title, bad_df in issues:
+        st.error(title)
+        st.dataframe(bad_df, use_container_width=True, hide_index=True)
+
+st.markdown("### 原始数据预览")
+st.dataframe(df.sort_values("date", ascending=False), use_container_width=True, hide_index=True)

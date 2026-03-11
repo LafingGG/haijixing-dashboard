@@ -110,9 +110,13 @@ def quality_gate_for_df(df_new: pd.DataFrame) -> Dict[str, Any]:
         if miss_pct > miss_threshold:
             reasons.append(f"{c} 缺失率 {miss_pct:.1f}% > {miss_threshold:.0f}%")
 
-    ok_publish = True
-    # 写入 staging 可以放宽（允许写入，但禁止发布），这里我建议仍允许写入，方便你检查
+    # ok_publish = True
+    # # 写入 staging 可以放宽（允许写入，但禁止发布），这里我建议仍允许写入，方便你检查
+    # ok_write = True
+    
+    # 写入 staging 可以放宽，方便管理员先预览；但只要存在关键质量问题，就禁止发布。
     ok_write = True
+    ok_publish = len(reasons) == 0
 
     return {"ok_write": ok_write, "ok_publish": ok_publish, "reasons": reasons}
 

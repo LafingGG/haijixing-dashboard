@@ -77,7 +77,12 @@ def ensure_snapshot_schema(db_path: str) -> None:
     - ensure publish_log exists
     - keep migration robust for old DBs
     """
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    if not db_path or not str(db_path).strip():
+        raise ValueError("数据库路径为空，请检查 get_db_path() 的返回值。")
+
+    db_dir = os.path.dirname(db_path)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(SNAPSHOT_TABLE_SQL)
