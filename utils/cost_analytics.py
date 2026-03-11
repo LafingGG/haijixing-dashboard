@@ -33,7 +33,6 @@ def _normalize_cost_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     out = df.copy()
 
-    # 统一列名映射
     month_col = _pick_first_existing(out, [
         "analysis_month", "cost_month", "month", "stat_month", "归属月份", "所属月份"
     ])
@@ -41,13 +40,19 @@ def _normalize_cost_columns(df: pd.DataFrame) -> pd.DataFrame:
         "allocated_amount", "amount", "cost_amount", "total_amount", "金额", "费用金额"
     ])
     category_col = _pick_first_existing(out, [
-        "category_level1", "category", "cost_category", "一级分类", "分类", "运营分类"
+        "category_level1", "level1_name", "level1", "category", "cost_category", "一级分类", "分类", "运营分类"
+    ])
+    category_name_col = _pick_first_existing(out, [
+        "category_name", "二级分类", "明细分类"
+    ])
+    category_code_col = _pick_first_existing(out, [
+        "category_code", "分类编码", "category_id"
     ])
     pay_date_col = _pick_first_existing(out, [
         "pay_date", "expense_date", "date", "付款日期", "费用日期"
     ])
     biz_start_col = _pick_first_existing(out, [
-        "biz_date_start", "start_date", "业务开始日期", "开始日期"
+        "biz_date_start", "service_date", "start_date", "业务开始日期", "开始日期"
     ])
     biz_end_col = _pick_first_existing(out, [
         "biz_date_end", "end_date", "业务结束日期", "结束日期"
@@ -56,7 +61,7 @@ def _normalize_cost_columns(df: pd.DataFrame) -> pd.DataFrame:
         "item_name", "expense_item", "item", "事项", "费用事项"
     ])
     vendor_col = _pick_first_existing(out, [
-        "vendor_name", "vendor", "supplier", "收款方", "供应商"
+        "vendor_name", "payee", "vendor", "supplier", "收款方", "供应商"
     ])
     remark_col = _pick_first_existing(out, [
         "remark", "notes", "note", "备注"
@@ -69,6 +74,10 @@ def _normalize_cost_columns(df: pd.DataFrame) -> pd.DataFrame:
         rename_map[amount_col] = "amount"
     if category_col:
         rename_map[category_col] = "category_level1"
+    if category_name_col:
+        rename_map[category_name_col] = "category_name"
+    if category_code_col:
+        rename_map[category_code_col] = "category_code"
     if pay_date_col:
         rename_map[pay_date_col] = "pay_date"
     if biz_start_col:
@@ -84,21 +93,22 @@ def _normalize_cost_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     out = out.rename(columns=rename_map)
 
-    # 类型处理
-    for col in ["amount"]:
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
+    if "amount" in out.columns:
+        out["amount"] = pd.to_numeric(out["amount"], errors="coerce")
 
     for col in ["pay_date", "biz_date_start", "biz_date_end"]:
         if col in out.columns:
             out[col] = pd.to_datetime(out[col], errors="coerce")
 
-    # 生成 allocated_amount
     if "allocated_amount" not in out.columns:
-        out["allocated_amount"] = out["amount"] if "amount" in out.columns else np.nan
+        if "allocated_ratio" in out.columns and "amount" in out.columns:
+            ratio = pd.to_numeric(out["allocated_ratio"], errors="coerce").fillna(1.0)
+            out["allocated_amount"] = out["amount"] * ratio
+        else:
+            out["allocated_amount"] = out["amount"] if "amount" in out.columns else np.nan
+
     out["allocated_amount"] = pd.to_numeric(out["allocated_amount"], errors="coerce")
 
-    # 生成 analysis_month
     if "analysis_month" not in out.columns or out["analysis_month"].isna().all():
         if "biz_date_start" in out.columns and out["biz_date_start"].notna().any():
             out["analysis_month"] = out["biz_date_start"].dt.strftime("%Y-%m")
@@ -107,7 +117,6 @@ def _normalize_cost_columns(df: pd.DataFrame) -> pd.DataFrame:
         else:
             out["analysis_month"] = np.nan
     else:
-        # 尽量规范成 YYYY-MM
         out["analysis_month"] = out["analysis_month"].astype(str).str.strip()
 
         def _norm_month(x: str) -> str:
@@ -136,6 +145,8 @@ def _normalize_cost_columns(df: pd.DataFrame) -> pd.DataFrame:
             "biz_date_end",
             "item_name",
             "vendor_name",
+            "category_code",
+            "category_name",
             "category_level1",
             "amount",
             "allocated_amount",
@@ -154,14 +165,12 @@ def _normalize_cost_columns(df: pd.DataFrame) -> pd.DataFrame:
 def load_cost_detail_data(db_path: str, snapshot_id: Optional[str] = None) -> pd.DataFrame:
     conn = sqlite3.connect(db_path)
     try:
-        # 优先读取已按运营归属整理好的表
         if _table_exists(conn, "fact_operational_cost"):
             df = pd.read_sql_query("SELECT * FROM fact_operational_cost", conn)
             df = _normalize_cost_columns(df)
             if not df.empty:
                 return df
 
-        # 兜底读取采购费用表
         if _table_exists(conn, "fact_purchase_expense"):
             df = pd.read_sql_query("SELECT * FROM fact_purchase_expense", conn)
             df = _normalize_cost_columns(df)
