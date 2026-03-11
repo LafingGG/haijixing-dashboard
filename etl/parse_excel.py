@@ -1,120 +1,164 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-EXCEL_EPOCH = pd.Timestamp("1899-12-30")  # pandas 的 Excel 序列号基准（兼容多数表）
+import numpy as np
+import pandas as pd
+
+EXCEL_EPOCH = pd.Timestamp("1899-12-30")
+
+HEADER_ALIASES: Dict[str, List[str]] = {
+    "日期": ["日期", "日期 "],
+    "来料(车)": ["来料(车)", "来料车次", "来料车", "进料车次"],
+    "来料(吨)": ["来料(吨)", "来料吨", "进料(吨)", "处理量(吨)"],
+    "出渣(车)": ["出渣(车)", "出渣车次", "出渣车"],
+    "出渣(吨)": ["出渣(吨)", "出渣吨"],
+    "出渣合计(吨)": ["出渣合计(吨)", "出渣合计吨", "总出渣(吨)"],
+    "制桨量m3": ["制桨量m3", "制浆量m3", "制桨量", "制浆量"],
+    "水表读数m3": ["水表读数m3", "水表读数", "水表累计m3"],
+    "用水量m3": ["用水量m3", "用水量", "日用水量m3"],
+    "电表读数X103kw*h": ["电表读数X103kw*h", "电表读数X10^3kw*h", "电表读数x103kw*h", "电表读数(千kWh)"],
+    "项目流量计m3": ["项目流量计m3", "项目流量计", "项目流量"],
+    "去水厂的浆料m3": ["去水厂的浆料m3", "去水厂浆料m3", "去水厂浆料"],
+    "水厂流量计m3": ["水厂流量计m3", "水厂流量计", "水厂流量"],
+    "到水厂的浆料m3": ["到水厂的浆料m3", "到水厂浆料m3", "到水厂浆料"],
+}
+
+NUMERIC_OUTPUT_COLUMNS = [
+    "incoming_trips",
+    "incoming_ton",
+    "slag_trips",
+    "slag_ton",
+    "slag_total_ton",
+    "slurry_m3",
+    "water_meter_m3",
+    "water_m3",
+    "elec_meter_x1e3kwh",
+    "elec_meter_kwh",
+    "proj_flow_m3",
+    "to_wwtp_m3",
+    "wwtp_flow_m3",
+    "arrive_wwtp_m3",
+]
+
+
+def _clean_text(x) -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return ""
+    return str(x).replace("\n", "").replace(" ", "").strip()
 
 
 def _excel_date_to_ts(x) -> pd.Timestamp | pd.NaT:
-    """把 Excel 序列号（例如 45992）转成日期。"""
     if pd.isna(x):
         return pd.NaT
-    # 有些情况下“日期”已经是 datetime/date
-    if isinstance(x, (pd.Timestamp, )):
+    if isinstance(x, pd.Timestamp):
         return x.normalize()
-    # python datetime/date
     if hasattr(x, "year") and hasattr(x, "month") and hasattr(x, "day"):
         return pd.Timestamp(x).normalize()
-
     try:
-        v = float(x)
-        # 45992 这类
-        return (EXCEL_EPOCH + pd.to_timedelta(int(v), unit="D")).normalize()
+        return (EXCEL_EPOCH + pd.to_timedelta(int(float(x)), unit="D")).normalize()
     except Exception:
-        return pd.NaT
+        out = pd.to_datetime(x, errors="coerce")
+        return out.normalize() if pd.notna(out) else pd.NaT
 
 
-def _clean_columns(cols: List) -> List[str]:
-    out = []
-    for c in cols:
-        if c is None:
-            out.append("")
-            continue
-        s = str(c)
-        s = s.replace("\n", "").strip()
-        out.append(s)
+def _find_header_row(raw: pd.DataFrame, scan_rows: int = 8) -> Tuple[Optional[int], Dict[str, int]]:
+    best_row = None
+    best_score = -1
+    best_map: Dict[str, int] = {}
+    alias_map = {std: {_clean_text(a) for a in aliases} for std, aliases in HEADER_ALIASES.items()}
+    for i in range(min(len(raw), scan_rows)):
+        row = [_clean_text(v) for v in raw.iloc[i].tolist()]
+        cur_map: Dict[str, int] = {}
+        score = 0
+        for std, aliases in alias_map.items():
+            for idx, cell in enumerate(row):
+                if cell in aliases:
+                    cur_map[std] = idx
+                    score += 1
+                    break
+        if score > best_score:
+            best_row = i
+            best_score = score
+            best_map = cur_map
+    if best_score < 2 or "日期" not in best_map:
+        return None, {}
+    return best_row, best_map
+
+
+def _pick_series(df: pd.DataFrame, logical_name: str) -> pd.Series:
+    if logical_name not in HEADER_ALIASES:
+        return pd.Series([np.nan] * len(df), index=df.index)
+    for alias in HEADER_ALIASES[logical_name]:
+        if alias in df.columns:
+            return df[alias]
+    clean_cols = {_clean_text(c): c for c in df.columns}
+    for alias in HEADER_ALIASES[logical_name]:
+        hit = clean_cols.get(_clean_text(alias))
+        if hit is not None:
+            return df[hit]
+    return pd.Series([np.nan] * len(df), index=df.index)
+
+
+def _sheet_to_daily_df(xlsx_path: str, sheet_name: str) -> pd.DataFrame:
+    raw = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None)
+    if raw.empty:
+        return pd.DataFrame()
+
+    header_row, _ = _find_header_row(raw)
+    if header_row is None:
+        return pd.DataFrame()
+
+    df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=header_row)
+    df.columns = [str(c).replace("\n", "").strip() for c in df.columns]
+
+    date_s = _pick_series(df, "日期")
+    out = pd.DataFrame({
+        "date": date_s.apply(_excel_date_to_ts),
+        "incoming_trips": _pick_series(df, "来料(车)"),
+        "incoming_ton": _pick_series(df, "来料(吨)"),
+        "slag_trips": _pick_series(df, "出渣(车)"),
+        "slag_ton": _pick_series(df, "出渣(吨)"),
+        "slag_total_ton": _pick_series(df, "出渣合计(吨)"),
+        "slurry_m3": _pick_series(df, "制桨量m3"),
+        "water_meter_m3": _pick_series(df, "水表读数m3"),
+        "water_m3": _pick_series(df, "用水量m3"),
+        "elec_meter_x1e3kwh": _pick_series(df, "电表读数X103kw*h"),
+        "proj_flow_m3": _pick_series(df, "项目流量计m3"),
+        "to_wwtp_m3": _pick_series(df, "去水厂的浆料m3"),
+        "wwtp_flow_m3": _pick_series(df, "水厂流量计m3"),
+        "arrive_wwtp_m3": _pick_series(df, "到水厂的浆料m3"),
+    })
+    out = out[out["date"].notna()].copy()
+    if out.empty:
+        return out
+
+    for col in NUMERIC_OUTPUT_COLUMNS:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    out["slag_total_ton"] = out["slag_total_ton"].fillna(out["slag_ton"])
+    out["elec_meter_kwh"] = out["elec_meter_x1e3kwh"] * 1000
+    out["source_sheet"] = sheet_name
     return out
 
 
 def parse_workbook(xlsx_path: str, sheet_names: Optional[List[str]] = None) -> pd.DataFrame:
-    """
-    读取你这类“月度运营表”（每个 sheet 一个月），规范化成一张按天的事实表。
-    兼容 2025.11/12 与 2026.1/2 字段差异：缺的字段填 NaN。
-    """
     xl = pd.ExcelFile(xlsx_path)
     sheets = sheet_names or xl.sheet_names
-
-    frames = []
+    frames: list[pd.DataFrame] = []
     for sh in sheets:
-        df = pd.read_excel(xlsx_path, sheet_name=sh, header=2)
-        df.columns = _clean_columns(list(df.columns))
-
-        # 过滤掉没有日期的行（合计/空行/标题行）
-        if "日期" not in df.columns:
-            continue
-        df = df[df["日期"].notna()].copy()
-
-        df["date"] = df["日期"].apply(_excel_date_to_ts)
-        df = df[df["date"].notna()].copy()
-
-        def pick(col: str) -> pd.Series:
-            return df[col] if col in df.columns else pd.Series([np.nan] * len(df), index=df.index)
-
-        out = pd.DataFrame({
-            "date": df["date"],
-            "incoming_trips": pick("来料(车)"),
-            "incoming_ton": pick("来料(吨)"),
-            "slag_trips": pick("出渣(车)"),
-            "slag_ton": pick("出渣(吨)"),
-            # 11/12 有“出渣合计(吨)”，1/2 没有则用出渣吨
-            "slag_total_ton": pick("出渣合计(吨)"),
-            "slurry_m3": pick("制桨量m3"),
-            "water_meter_m3": pick("水表读数m3"),
-            "water_m3": pick("用水量m3"),
-            "elec_meter_x1e3kwh": pick("电表读数X103kw*h"),
-            "proj_flow_m3": pick("项目流量计m3"),
-            "to_wwtp_m3": pick("去水厂的浆料m3"),
-            "wwtp_flow_m3": pick("水厂流量计m3"),
-            "arrive_wwtp_m3": pick("到水厂的浆料m3"),
-        })
-
-        # 列名在不同 sheet 里可能是 “制桨量\nm3” 这类，前面已经去掉换行；但仍可能存在空格差异
-        # 再兜底一次：如果主列全空但存在相近列名，就补上
-        def fallback(dst: str, candidates: List[str]):
-            if out[dst].notna().any():
-                return
-            for c in candidates:
-                if c in df.columns:
-                    out[dst] = df[c]
-                    return
-
-        fallback("slurry_m3", ["制桨量m3", "制浆量m3", "制桨量 m3", "制浆量 m3"])
-        fallback("water_meter_m3", ["水表读数m3", "水表读数 m3"])
-        fallback("water_m3", ["用水量m3", "用水量 m3"])
-        fallback("elec_meter_x1e3kwh", ["电表读数X103kw*h", "电表读数 X103kw*h", "电表读数X10^3kw*h"])
-
-        # 出渣合计：若没有则用出渣吨
-        if out["slag_total_ton"].isna().all():
-            out["slag_total_ton"] = out["slag_ton"]
-
-        # 电表换算到 kWh：表头显示 X10^3 kWh
-        out["elec_meter_kwh"] = out["elec_meter_x1e3kwh"] * 1000.0
-
-        out["source_sheet"] = sh
-        frames.append(out)
+        try:
+            cur = _sheet_to_daily_df(xlsx_path, sh)
+        except Exception:
+            cur = pd.DataFrame()
+        if not cur.empty:
+            frames.append(cur)
 
     if not frames:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["date", *NUMERIC_OUTPUT_COLUMNS, "source_sheet"])
 
-    all_df = pd.concat(frames, ignore_index=True)
-
-    # 统一数值列为 numeric
-    num_cols = [c for c in all_df.columns if c not in ("date", "source_sheet")]
-    for c in num_cols:
-        all_df[c] = pd.to_numeric(all_df[c], errors="coerce")
-
-    all_df = all_df.sort_values("date").reset_index(drop=True)
-    return all_df
+    df = pd.concat(frames, ignore_index=True)
+    df = df.sort_values(["date", "source_sheet"]).drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+    return df
