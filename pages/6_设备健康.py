@@ -17,6 +17,7 @@ from utils.paths import get_db_path
 from utils.bootstrap import bootstrap_page
 from utils.device_store import save_device_excel_for_staging, get_published_device_excel_path
 from utils.snapshot import get_active_snapshot_id
+from utils.device_analytics import get_device_fault_ranking
 
 
 # ============================================================
@@ -54,7 +55,6 @@ def _norm_date_series(s: pd.Series) -> pd.Series:
     if out.notna().any():
         return out.dt.normalize()
 
-    # Excel serial
     try:
         num = pd.to_numeric(s, errors="coerce")
         out2 = pd.to_datetime("1899-12-30") + pd.to_timedelta(num.fillna(-1).astype("int64"), unit="D")
@@ -73,13 +73,10 @@ def _to_dt(s: pd.Series) -> pd.Series:
 def _combine_date_and_time(date_s: pd.Series, time_s: pd.Series) -> pd.Series:
     """
     将“日期列 + 时间列”组合成完整 datetime。
-    兼容：
-    - Excel 读出来的 datetime.time
-    - 字符串时间，如 '07:00:00'
-    - 已经是 datetime 的情况
     """
     if date_s is None or time_s is None:
-        return pd.Series(pd.NaT, index=time_s.index if time_s is not None else date_s.index)
+        idx = time_s.index if time_s is not None else date_s.index
+        return pd.Series(pd.NaT, index=idx)
 
     base_date = _norm_date_series(date_s)
 
@@ -89,22 +86,17 @@ def _combine_date_and_time(date_s: pd.Series, time_s: pd.Series) -> pd.Series:
             out.append(pd.NaT)
             continue
 
-        # 如果本身已经是完整时间戳
         if isinstance(t, pd.Timestamp):
             out.append(t)
             continue
 
-        # 先尝试直接解析成 datetime
         parsed = pd.to_datetime(t, errors="coerce")
         if pd.notna(parsed):
-            # 如果解析结果带日期且不是默认日期，就直接用
             if getattr(parsed, "year", None) and parsed.year not in (1900, 1970):
                 out.append(parsed)
                 continue
 
-        # 再按纯时间处理
         try:
-            # datetime.time / 类 time 对象
             if hasattr(t, "hour") and hasattr(t, "minute") and hasattr(t, "second"):
                 hh = int(t.hour)
                 mm = int(t.minute)
@@ -114,7 +106,6 @@ def _combine_date_and_time(date_s: pd.Series, time_s: pd.Series) -> pd.Series:
         except Exception:
             pass
 
-        # 字符串时间
         ts = str(t).strip()
         m = re.match(r"^(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$", ts)
         if m:
@@ -130,10 +121,6 @@ def _combine_date_and_time(date_s: pd.Series, time_s: pd.Series) -> pd.Series:
 
 
 def _to_dt_with_date(date_s: pd.Series, time_s: pd.Series) -> pd.Series:
-    """
-    优先按“日期 + 时间”组合。
-    如果时间列本身已经是完整 datetime，也能兼容。
-    """
     return _combine_date_and_time(date_s, time_s)
 
 
@@ -292,6 +279,7 @@ def _normalize_fault_df(df: pd.DataFrame) -> pd.DataFrame:
         df["_end_dt"] = _to_dt_with_date(df["日期"], df[end_col])
     else:
         df["_end_dt"] = pd.NaT
+
     return df
 
 
@@ -315,6 +303,7 @@ def load_all_data_from_path(path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
             equip_frames.append(_normalize_equipment_df(df, sysname))
         except Exception:
             continue
+
     equip = pd.concat(equip_frames, ignore_index=True) if equip_frames else pd.DataFrame(
         columns=["设备id", "设备名称", "系统", "设备状态"]
     )
@@ -343,6 +332,7 @@ def load_all_data_from_bytes(filename: str, content: bytes) -> Tuple[pd.DataFram
             equip_frames.append(_normalize_equipment_df(df, sysname))
         except Exception:
             continue
+
     equip = pd.concat(equip_frames, ignore_index=True) if equip_frames else pd.DataFrame(
         columns=["设备id", "设备名称", "系统", "设备状态"]
     )
@@ -357,12 +347,6 @@ def load_all_data_from_bytes(filename: str, content: bytes) -> Tuple[pd.DataFram
 
 
 def health_summary(items):
-    """
-    健康统计口径：
-    - 分母 = 当前控制塔中该系统/线别的全部节点数
-    - 分子 = final_level == 1（绿灯）的节点数
-    - 黄灯/红灯/白灯都不计入“正常”
-    """
     total = len(items)
     healthy = sum(1 for x in items if x.final_level == 1)
     return healthy, total
@@ -402,7 +386,7 @@ def _status_to_level(status_text: str) -> int:
 
 def _overlay_faults_level(eid: str, faults_in_range: pd.DataFrame) -> int:
     """
-    叠加规则（你确认后的正式逻辑）：
+    叠加规则：
     - 红灯：存在未结束停机
     - 黄灯：本周期有异常记录，或有已结束停机
     - 无叠加：本周期无异常
@@ -422,15 +406,12 @@ def _overlay_faults_level(eid: str, faults_in_range: pd.DataFrame) -> int:
         latest = sf.sort_values("日期", ascending=False).head(1)
         end_dt = latest["_end_dt"].iloc[0]
 
-        # 未结束停机 -> 红灯
         if pd.isna(end_dt):
             return 3
-
-        # 已结束停机 -> 黄灯
         return 2
 
-    # 只要本周期有异常记录（即使未停机）-> 黄灯
     return 2
+
 
 def _find_equip_by_id(equip: pd.DataFrame, eid: str) -> Optional[pd.Series]:
     if equip is None or equip.empty:
@@ -455,12 +436,9 @@ def _find_equip_by_name_like(equip: pd.DataFrame, keyword: str, extra_pattern: O
     if not cand.empty:
         return cand.iloc[0]
     return None
+
+
 def _find_equip_by_name_with_no(equip: pd.DataFrame, keyword: str, no: int) -> Optional[pd.Series]:
-    """
-    按“设备名称 + 编号”匹配，例如：
-    - 破袋机 + 1  => 匹配 破袋机#1 / 破袋机1
-    - 闸板阀 + 2  => 匹配 闸板阀#2 / 闸板阀2
-    """
     if equip is None or equip.empty:
         return None
 
@@ -469,8 +447,6 @@ def _find_equip_by_name_with_no(equip: pd.DataFrame, keyword: str, no: int) -> O
         return None
 
     name_s = equip["设备名称"].astype(str)
-
-    # 先筛关键词
     cand = equip[name_s.str.contains(re.escape(kw), na=False)].copy()
     if cand.empty:
         return None
@@ -487,7 +463,6 @@ def _find_equip_by_name_with_no(equip: pd.DataFrame, keyword: str, no: int) -> O
         if not hit.empty:
             return hit.iloc[0]
 
-    # 如果还没匹配到，再放宽一点：名字里含 no 且含关键词
     hit = cand[cand["设备名称"].astype(str).str.contains(fr"\b{no}\b", na=False, regex=True)]
     if not hit.empty:
         return hit.iloc[0]
@@ -526,6 +501,7 @@ def resolve_node(
 
     return NodeResolved(block, line, node, rule, eid, ename, base, final)
 
+
 def resolve_node_by_no(
     equip: pd.DataFrame,
     faults_in_range: pd.DataFrame,
@@ -536,12 +512,6 @@ def resolve_node_by_no(
     no: int,
     prefer_id: Optional[str] = None,
 ) -> NodeResolved:
-    """
-    用于预处理线别这类“同名设备有 #1/#2 区分”的节点匹配。
-    优先：
-    1) prefer_id
-    2) 设备名称 + 编号
-    """
     row = None
     rule = ""
 
@@ -565,6 +535,7 @@ def resolve_node_by_no(
     final = max(base_level, overlay)
 
     return NodeResolved(block, line, node, rule, eid, ename, base, final)
+
 
 def worst_level(levels: List[int]) -> int:
     return max(levels) if levels else 0
@@ -608,7 +579,7 @@ if DEBUG:
 
 
 # ------------------------------------------------------------
-# Sidebar containers (fixed order)
+# Sidebar containers
 # ------------------------------------------------------------
 time_box = st.sidebar.container()
 filter_box = st.sidebar.container()
@@ -617,8 +588,6 @@ data_box = st.sidebar.container()
 
 # ------------------------------------------------------------
 # Data source: role-aware
-# viewer: published only
-# admin: published OR staging preview (upload)
 # ------------------------------------------------------------
 if "device_uploaded_bytes" not in st.session_state:
     st.session_state.device_uploaded_bytes = b""
@@ -641,18 +610,14 @@ with data_box:
         uploaded = st.file_uploader("上传设备记录表（xlsx）", type=["xlsx"], key="device_uploader")
         st.caption("要求：包含工作表「异常记录」以及设备台账 Sheets（预处理/水解酸化/除臭/车间基础）。")
         if uploaded is not None:
-            # 1) 保存到 staging（用于发布机制）
             try:
                 save_device_excel_for_staging(DB_PATH, uploaded.getbuffer())
                 st.success("✅ 已保存到草稿快照（staging）。发布后厂长可见。")
             except Exception as e:
                 st.error(f"保存到草稿快照失败：{e}")
 
-            # 2) 同时缓存本次上传字节，用于本页“草稿预览”
             st.session_state.device_uploaded_name = uploaded.name
             st.session_state.device_uploaded_bytes = uploaded.getvalue()
-
-            # 默认切到草稿预览
             st.session_state.device_view_mode = "草稿（本次上传预览）"
             st.rerun()
     else:
@@ -672,7 +637,6 @@ if device_view_mode == "草稿（本次上传预览）":
     if b:
         equip, faults = load_all_data_from_bytes(n, b)
     else:
-        # 没有上传就提示
         equip, faults = pd.DataFrame(), pd.DataFrame()
 else:
     p = get_published_device_excel_path(DB_PATH)
@@ -683,7 +647,7 @@ else:
 
 
 # ------------------------------------------------------------
-# If no data, show hint (time first, then data source)
+# If no data
 # ------------------------------------------------------------
 if equip.empty and faults.empty:
     with time_box:
@@ -700,7 +664,7 @@ if equip.empty and faults.empty:
 
 
 # ------------------------------------------------------------
-# Time bounds (prefer faults date if available; else fallback)
+# Time bounds
 # ------------------------------------------------------------
 if not faults.empty and "日期" in faults.columns:
     date_min = faults["日期"].dt.date.min()
@@ -713,11 +677,16 @@ months = []
 if not faults.empty and "日期" in faults.columns:
     months = sorted(faults["日期"].dt.to_period("M").astype(str).unique().tolist())
 
+
+# ------------------------------------------------------------
+# Session state init
+# ------------------------------------------------------------
 if "dev_start_date" not in st.session_state:
-    st.session_state.dev_end_date = date_max
     st.session_state.dev_start_date = max(date_min, (pd.Timestamp(date_max) - pd.Timedelta(days=30)).date())
+
 if "dev_end_date" not in st.session_state:
     st.session_state.dev_end_date = date_max
+
 if "dev_month_pick" not in st.session_state:
     st.session_state.dev_month_pick = "自定义"
 
@@ -779,14 +748,12 @@ with time_box:
 
     start_date = st.date_input(
         "开始日期",
-        value=st.session_state.dev_start_date,
         min_value=date_min,
         max_value=date_max,
         key="dev_start_date",
     )
     end_date = st.date_input(
         "结束日期",
-        value=st.session_state.dev_end_date,
         min_value=date_min,
         max_value=date_max,
         key="dev_end_date",
@@ -827,7 +794,6 @@ if not faults.empty and "日期" in faults.columns:
 tower_nodes: List[NodeResolved] = []
 
 # ---- 预处理系统（2线）
-# 1线：提桶机#1/#2、破袋机#1、闸板阀#1、细破碎机#1、螺旋压榨机#1
 pre_line1 = [
     ("提桶机#1", "EQ_PRE_002", None, None),
     ("提桶机#2", "EQ_PRE_003", None, None),
@@ -863,7 +829,6 @@ for node, eid, kw, no in pre_line1:
             )
         )
 
-# 2线：提桶机#3/#4、破袋机#2、闸板阀#2、粗破碎机#2、细破碎机#2、螺旋压榨机#2
 pre_line2 = [
     ("提桶机#3", "EQ_PRE_004", None, None),
     ("提桶机#4", "EQ_PRE_005", None, None),
@@ -1084,6 +1049,16 @@ with st.expander("🧩 节点映射诊断（建议首次上线先看一眼）", 
         )
 
 st.divider()
+st.subheader("📋 设备异常排行榜")
+
+rank_df = get_device_fault_ranking(DB_PATH, recent_days=90)
+
+if rank_df.empty:
+    st.info("暂无可展示的设备异常排行数据。")
+else:
+    st.dataframe(rank_df, use_container_width=True, hide_index=True, height=420)
+
+st.divider()
 
 # ============================================================
 # Analytics section (fault KPI + trend + Top10 + raw)
@@ -1097,7 +1072,7 @@ else:
     total_events = int(len(dff))
     unique_devices = int(dff["设备id"].nunique()) if "设备id" in dff.columns else 0
 
-    stop_mask = dff["是否停机"].astype(str).str.contains("是", na=False) if "是否停机" in dff.columns else pd.Series([False]*len(dff))
+    stop_mask = dff["是否停机"].astype(str).str.contains("是", na=False) if "是否停机" in dff.columns else pd.Series([False] * len(dff))
     stop_df = dff[stop_mask].copy()
     downtime_hours_sum = float(pd.to_numeric(stop_df["停机小时"], errors="coerce").fillna(0).sum()) if "停机小时" in stop_df.columns else 0.0
 
