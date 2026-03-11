@@ -18,6 +18,8 @@ from utils.bootstrap import bootstrap_page
 from utils.device_store import save_device_excel_for_staging, get_published_device_excel_path
 from utils.snapshot import get_active_snapshot_id
 
+from utils.device_analytics import get_device_fault_ranking
+
 
 # ============================================================
 # Debug flag (safe without secrets)
@@ -1082,6 +1084,16 @@ with st.expander("🧩 节点映射诊断（建议首次上线先看一眼）", 
             f"有 {len(missing)} 个节点未匹配到设备台账（显示为⚪）。"
             "通常是设备名称/编号不一致导致；把这些行的台账真实名称发我，我帮你调匹配规则。"
         )
+
+st.divider()
+st.subheader("📋 设备异常排行榜")
+
+rank_df = get_device_fault_ranking(DB_PATH, recent_days=90)
+
+if rank_df.empty:
+    st.info("暂无可展示的设备异常排行数据。")
+else:
+    st.dataframe(rank_df, use_container_width=True, hide_index=True, height=420)
 
 st.divider()
 

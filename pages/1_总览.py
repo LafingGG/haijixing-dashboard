@@ -17,6 +17,7 @@ from utils.snapshot import get_active_snapshot_id
 import plotly.graph_objects as go
 from utils.ops_kpi import get_latest_ops_kpis, get_recent_ops_trend, classify_data_freshness
 from utils.device_summary import get_home_device_status
+from utils.cost_store import build_cost_dashboard_dataset
 
 DB_PATH = get_db_path()
 user = bootstrap_page(DB_PATH)
@@ -72,6 +73,34 @@ def load_data() -> pd.DataFrame:
     conn.close()
     return df
 
+@st.cache_data(ttl=60)
+def get_prev_month_cost_kpi(db_path):
+    data = build_cost_dashboard_dataset(db_path)
+    monthly = data["monthly_with_ops"]
+
+    if monthly.empty:
+        return None
+
+    monthly = monthly.copy()
+    monthly["analysis_month"] = monthly["analysis_month"].astype(str)
+    monthly = monthly.sort_values("analysis_month")
+
+    # 优先取上一个自然月
+    prev_month = (pd.Timestamp.today().to_period("M") - 1).strftime("%Y-%m")
+    hit = monthly[monthly["analysis_month"] == prev_month]
+
+    if not hit.empty:
+        row = hit.iloc[-1]
+    else:
+        # 如果上月没有数据，则退回到最近一个有成本数据的月份
+        row = monthly.iloc[-1]
+
+    return {
+        "month": row["analysis_month"],
+        "total_cost": row["total_cost"],
+        "ton_cost": row["ton_cost"],
+        "incoming_ton": row["incoming_ton"],
+    }
 
 def add_daily_elec(df: pd.DataFrame) -> pd.DataFrame:
     """电表读数为抄表点：相邻抄表差分 -> 均摊到区间内每一天，得到 daily_elec_kwh。"""
@@ -212,7 +241,9 @@ else:
     days_lag = latest_kpi["days_lag"]
     device_info = get_home_device_status(DB_PATH)
 
-    c1, c2, c3, c4 = st.columns(4)
+    cost_kpi = get_prev_month_cost_kpi(DB_PATH)
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
 
     c1.metric(
         "最近处理量",
@@ -233,6 +264,20 @@ else:
         "数据日期",
         latest_date.strftime("%Y-%m-%d") if latest_date is not None and pd.notna(latest_date) else "-"
     )
+
+    if cost_kpi:
+        c5.metric(
+            "上月运营费用",
+            f"{cost_kpi['total_cost']:,.0f} 元"
+        )
+
+        c6.metric(
+            "上月吨均成本",
+            "-" if pd.isna(cost_kpi["ton_cost"]) else f"{cost_kpi['ton_cost']:.1f} 元/吨"
+        )
+    else:
+        c5.metric("上月运营费用", "-")
+        c6.metric("上月吨均成本", "-")
 
     st.caption(f"设备状态说明：{device_info['detail']}")
 
