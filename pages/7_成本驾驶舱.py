@@ -210,22 +210,49 @@ if detail_df.empty:
     st.warning("当前暂无成本明细数据。管理员可在本页上方上传采购费用 Excel。")
     st.stop()
 
-date_col = find_first_existing_col(
-    detail_df,
-    ["expense_date", "pay_date", "biz_date_start", "biz_date_end"],
-)
-
-if date_col is None:
-    st.warning("成本明细中缺少可用于时间筛选的日期字段（expense_date / pay_date / biz_date_start / biz_date_end）。")
-    st.stop()
-
+# 优先按成本归属月份（analysis_month）筛选；若没有，再退回付款日期等字段
 detail_df = detail_df.copy()
-detail_df[date_col] = pd.to_datetime(detail_df[date_col], errors="coerce")
-detail_df = detail_df[detail_df[date_col].notna()].copy()
 
-if detail_df.empty:
-    st.warning("成本明细存在记录，但日期字段无法解析。请检查导入数据。")
-    st.stop()
+if "analysis_month" in detail_df.columns:
+    detail_df["analysis_month"] = (
+        detail_df["analysis_month"]
+        .astype(str)
+        .str.strip()
+        .replace({"": None, "None": None, "nan": None})
+    )
+
+    # 保留原 analysis_month（YYYY-MM）给后续月度汇总使用
+    # 单独生成一个筛选辅助日期列
+    detail_df["_filter_date"] = pd.to_datetime(
+        detail_df["analysis_month"] + "-01",
+        errors="coerce",
+    )
+
+    detail_df = detail_df[detail_df["_filter_date"].notna()].copy()
+
+    if detail_df.empty:
+        st.warning("成本明细存在记录，但 analysis_month 无法解析。请检查导入数据。")
+        st.stop()
+
+    date_col = "_filter_date"
+
+else:
+    date_col = find_first_existing_col(
+        detail_df,
+        ["expense_date", "pay_date", "biz_date_start", "biz_date_end"],
+    )
+
+    if date_col is None:
+        st.warning("成本明细中缺少可用于时间筛选的日期字段（analysis_month / expense_date / pay_date / biz_date_start / biz_date_end）。")
+        st.stop()
+
+    detail_df[date_col] = pd.to_datetime(detail_df[date_col], errors="coerce")
+    detail_df = detail_df[detail_df[date_col].notna()].copy()
+
+    if detail_df.empty:
+        st.warning("成本明细存在记录，但日期字段无法解析。请检查导入数据。")
+        st.stop()
+
 
 # ============================================================
 # 固定趋势数据：始终取完整成本数据里的最近 6 个月
@@ -256,7 +283,6 @@ start_date, end_date, date_meta = render_global_sidebar_by_df(
     detail_df.rename(columns={date_col: "date"}),
     date_col="date",
 )
-st.caption(f"当前筛选区间：{date_meta['label']}")
 
 view_detail_df = detail_df[
     (detail_df[date_col].dt.date >= start_date) & (detail_df[date_col].dt.date <= end_date)
@@ -265,6 +291,21 @@ view_detail_df = detail_df[
 if view_detail_df.empty:
     st.warning("当前筛选区间内无成本明细，请调整侧边栏时间范围。")
     st.stop()
+
+if "analysis_month" in view_detail_df.columns and not view_detail_df.empty:
+    selected_months = sorted(
+        {
+            str(x).strip()
+            for x in view_detail_df["analysis_month"].dropna().astype(str).tolist()
+            if str(x).strip()
+        }
+    )
+    if selected_months:
+        st.caption(f"当前成本归属月份：{' ~ '.join([selected_months[0], selected_months[-1]])}")
+    else:
+        st.caption(f"当前筛选区间：{date_meta['label']}")
+else:
+    st.caption(f"当前筛选区间：{date_meta['label']}")
 
 # ============================================================
 # 基于筛选区间重建汇总
@@ -309,12 +350,39 @@ cur_cat["amount_share"] = cur_cat["amount"] / total_amount if total_amount else 
 
 # ============================================================
 # 处理量口径修复：
-# 不再从成本汇总表取处理量，直接按当前时间区间从运营日报统计
+# 成本页按 analysis_month 做归属时，处理量也按对应月份汇总
 # ============================================================
 period_cost = float(month_total_df["amount"].sum()) if not month_total_df.empty else 0.0
 
 period_ton = 0.0
-if not ops_df.empty and "date" in ops_df.columns and "incoming_ton" in ops_df.columns:
+
+# 优先按当前筛选结果里的 analysis_month 去汇总运营处理量
+if (
+    "analysis_month" in view_detail_df.columns
+    and not view_detail_df.empty
+    and not ops_monthly_df.empty
+    and "month" in ops_monthly_df.columns
+    and "incoming_ton" in ops_monthly_df.columns
+):
+    selected_months = sorted(
+        {
+            str(x).strip()
+            for x in view_detail_df["analysis_month"].dropna().astype(str).tolist()
+            if str(x).strip()
+        }
+    )
+
+    ops_monthly_view = ops_monthly_df.copy()
+    ops_monthly_view["month"] = ops_monthly_view["month"].astype(str).str.strip()
+
+    ops_monthly_view = ops_monthly_view[
+        ops_monthly_view["month"].isin(selected_months)
+    ].copy()
+
+    period_ton = float(ops_monthly_view["incoming_ton"].sum(skipna=True)) if not ops_monthly_view.empty else 0.0
+
+# 兜底：如果没有 analysis_month，再按日期区间从运营日报统计
+elif not ops_df.empty and "date" in ops_df.columns and "incoming_ton" in ops_df.columns:
     ops_df = ops_df.copy()
     ops_df["date"] = pd.to_datetime(ops_df["date"], errors="coerce")
     ops_view_df = ops_df[
