@@ -229,6 +229,25 @@ def _parse_service_dates(item_name: str, expense_date_str: str) -> Tuple[List[da
 
     return [], "payment_date"
 
+def infer_level1_category(item_name: str, category_name: str) -> str:
+    text = f"{item_name} {category_name}".strip().lower()
+
+    if any(k in text for k in ["固渣", "渣外运", "渣处理", "污泥", "残渣", "垃圾处理", "外运处置"]):
+        return "固渣处理费"
+
+    if any(k in text for k in ["碳源", "有机酸", "发酵液", "水厂", "污水厂", "制酸", "酸液"]):
+        return "碳源费"
+
+    if any(k in text for k in ["电费", "水费", "能源", "电耗", "水耗"]):
+        return "能源费用"
+
+    if any(k in text for k in ["维修", "检修", "备件", "保养"]):
+        return "维修费用"
+
+    if any(k in text for k in ["运输", "物流", "运费"]):
+        return "运输费"
+
+    return "其他费用"
 
 def parse_purchase_workbook(xlsx_path: str, sheet_names: Optional[List[str]] = None) -> pd.DataFrame:
     xl = pd.ExcelFile(xlsx_path)
@@ -270,8 +289,27 @@ def parse_purchase_workbook(xlsx_path: str, sheet_names: Optional[List[str]] = N
             body["remark"] = None
 
         body["category_name"] = body["category_name"].fillna("其他").astype(str).str.strip().replace({"": "其他"})
-        body["category_code"] = body["category_name"].map(lambda x: category_lookup.get(x, ("other", "其他费用"))[0])
-        body["level1_name"] = body["category_name"].map(lambda x: category_lookup.get(x, ("other", "其他费用"))[1])
+        # body["category_code"] = body["category_name"].map(lambda x: category_lookup.get(x, ("other", "其他费用"))[0])
+        # body["level1_name"] = body["category_name"].map(lambda x: category_lookup.get(x, ("other", "其他费用"))[1])
+        body["level1_name"] = body.apply(
+            lambda r: infer_level1_category(
+                str(r.get("item_name") or ""),
+                str(r.get("category_name") or ""),
+            ),
+            axis=1,
+        )
+
+        level1_to_code = {
+            "固渣处理费": "slag_disposal",
+            "碳源费": "carbon_source",
+            "能源费用": "energy_cost",
+            "维修费用": "maintenance",
+            "运输费": "transport",
+            "其他费用": "other",
+        }
+
+        body["category_code"] = body["level1_name"].map(level1_to_code).fillna("other")
+    
 
         body["expense_date"] = body["expense_date"].dt.strftime("%Y-%m-%d")
         body["expense_month"] = pd.to_datetime(body["expense_date"]).dt.to_period("M").astype(str)
@@ -356,3 +394,5 @@ def parse_purchase_workbook(xlsx_path: str, sheet_names: Optional[List[str]] = N
     out = pd.concat(frames, ignore_index=True)
     out = out.sort_values(["expense_date", "source_sheet", "source_row_no"]).reset_index(drop=True)
     return out
+
+
