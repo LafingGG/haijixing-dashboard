@@ -24,6 +24,43 @@ HEADER_ALIASES = {
 
 DEFAULT_SHEETS = ["费用明细表", "费用明细", "项目垃圾处理费用"]
 
+CATEGORY_NAME_ALIASES = {
+    # 固渣
+    "固渣费": "固渣处理费",
+    "固渣处理": "固渣处理费",
+    "固渣处理费用": "固渣处理费",
+    "渣处理费": "固渣处理费",
+    "渣外运费": "固渣处理费",
+    "固废处理费": "固渣处理费",
+
+    # 碳源
+    "碳源费": "碳源处理费",
+    "碳源": "碳源处理费",
+    "碳源处理费": "碳源处理费",
+    "碳源处置费": "碳源处理费",
+    "有机酸费": "碳源处理费",
+    "有机酸处理费": "碳源处理费",
+    "发酵液处理费": "碳源处理费",
+    "浆料处理费": "碳源处理费",
+
+    # 能源
+    "能源费": "能源费用",
+    "水电费": "能源费用",
+    "电费水费": "能源费用",
+
+    # 维修
+    "维修费": "维修费用",
+    "检修费": "维修费用",
+    "保养费": "维修费用",
+
+    # 运输
+    "物流费": "运输费",
+    "运费": "运输费",
+
+    # 行政/后勤
+    "宿舍费用": "宿舍后勤",
+    "后勤费用": "宿舍后勤",
+}
 
 def _clean_value(x):
     if pd.isna(x):
@@ -35,6 +72,13 @@ def _clean_value(x):
 
 def _norm_col(s: str) -> str:
     return str(s).replace("\n", "").replace(" ", "").strip()
+
+
+def _normalize_category_name(x: str) -> str:
+    s = str(x or "").strip()
+    s = s.replace("（", "(").replace("）", ")")
+    s = s.replace(" ", "")
+    return CATEGORY_NAME_ALIASES.get(s, s)
 
 
 def _find_header_row(df0: pd.DataFrame) -> Tuple[Optional[int], Dict[str, int]]:
@@ -63,9 +107,20 @@ def _find_header_row(df0: pd.DataFrame) -> Tuple[Optional[int], Dict[str, int]]:
 
 
 def _build_category_lookup() -> Dict[str, Tuple[str, str]]:
+    """
+    返回：
+        {
+            "能源费用": ("energy_cost", "能源费用"),
+            "固渣处理费": ("slag", "运营费用"),
+            "有机酸处理费": ("acid", "运营费用"),
+            ...
+        }
+    """
     out = {}
     for category_code, category_name, level1_name, *_ in CATEGORY_SEED:
-        out[str(category_name).strip()] = (category_code, level1_name)
+        key = str(category_name).strip()
+        if key:
+            out[key] = (str(category_code).strip(), str(level1_name).strip())
     return out
 
 
@@ -90,10 +145,10 @@ def _daterange(d1: date, d2: date) -> List[date]:
 
 def _parse_month_only_token(text: str, expense_dt: date) -> List[date]:
     months = []
-    for y, m in re.findall(r'(\d{4})[./年\-](\d{1,2})月?份?', text):
+    for y, m in re.findall(r"(\d{4})[./年\-](\d{1,2})月?份?", text):
         months.append((int(y), int(m)))
     if not months:
-        for m in re.findall(r'(?<!\d)(\d{1,2})月?份', text):
+        for m in re.findall(r"(?<!\d)(\d{1,2})月?份", text):
             mm = int(m)
             yy = _infer_year(mm, expense_dt)
             months.append((yy, mm))
@@ -106,12 +161,12 @@ def _parse_month_only_token(text: str, expense_dt: date) -> List[date]:
 
 def _parse_full_dates(text: str, expense_dt: date) -> List[date]:
     out = []
-    for y, m, d in re.findall(r'(\d{4})[./年\-](\d{1,2})[./月\-](\d{1,2})日?', text):
+    for y, m, d in re.findall(r"(\d{4})[./年\-](\d{1,2})[./月\-](\d{1,2})日?", text):
         try:
             out.append(date(int(y), int(m), int(d)))
         except Exception:
             pass
-    for m, d in re.findall(r'(?<!\d)(\d{1,2})[./月](\d{1,2})(?!\d)', text):
+    for m, d in re.findall(r"(?<!\d)(\d{1,2})[./月](\d{1,2})(?!\d)", text):
         mm = int(m)
         dd = int(d)
         yy = _infer_year(mm, expense_dt)
@@ -127,23 +182,19 @@ def _parse_compact_token(token: str, expense_dt: date) -> List[date]:
     if not token:
         return []
 
-    # yyyy.m月份 / yyyy年m月份
     month_only = _parse_month_only_token(token, expense_dt)
     if month_only and ("月份" in token or token.endswith("月") or token.endswith("月份")):
         return month_only
 
-    # 先处理完整日期
     fulls = _parse_full_dates(token, expense_dt)
     if fulls and "-" not in token and "至" not in token and "到" not in token:
         return fulls
 
-    # 范围分隔统一
     tk = token.replace("至", "-").replace("到", "-").replace("—", "-").replace("–", "-")
     tk = tk.replace("（", "(").replace("）", ")")
-    tk = re.sub(r'\(.*?\)', '', tk).strip()
+    tk = re.sub(r"\(.*?\)", "", tk).strip()
 
-    # 形如 11.25-11.27
-    m = re.fullmatch(r'(\d{1,2})[./月](\d{1,2})\s*-\s*(\d{1,2})[./月](\d{1,2})', tk)
+    m = re.fullmatch(r"(\d{1,2})[./月](\d{1,2})\s*-\s*(\d{1,2})[./月](\d{1,2})", tk)
     if m:
         m1, d1, m2, d2 = map(int, m.groups())
         y1 = _infer_year(m1, expense_dt)
@@ -153,8 +204,7 @@ def _parse_compact_token(token: str, expense_dt: date) -> List[date]:
         except Exception:
             return []
 
-    # 形如 11.28-29 / 1.1-5
-    m = re.fullmatch(r'(\d{1,2})[./月](\d{1,2})\s*-\s*(\d{1,2})', tk)
+    m = re.fullmatch(r"(\d{1,2})[./月](\d{1,2})\s*-\s*(\d{1,2})", tk)
     if m:
         mm, d1, d2 = map(int, m.groups())
         yy = _infer_year(mm, expense_dt)
@@ -163,8 +213,7 @@ def _parse_compact_token(token: str, expense_dt: date) -> List[date]:
         except Exception:
             return []
 
-    # 形如 12.05 / 1.29
-    m = re.fullmatch(r'(\d{1,2})[./月](\d{1,2})', tk)
+    m = re.fullmatch(r"(\d{1,2})[./月](\d{1,2})", tk)
     if m:
         mm, dd = map(int, m.groups())
         yy = _infer_year(mm, expense_dt)
@@ -173,7 +222,6 @@ def _parse_compact_token(token: str, expense_dt: date) -> List[date]:
         except Exception:
             return []
 
-    # 月份文本
     if month_only:
         return month_only
 
@@ -208,7 +256,6 @@ def _parse_service_dates(item_name: str, expense_date_str: str) -> Tuple[List[da
         ds = _parse_compact_token(tk, expense_dt)
         if not ds:
             continue
-        # 如果是“月份”文本，只保留每月1号作为月份锚点
         if any(d.day == 1 for d in ds) and ("月份" in tk or tk.endswith("月") or tk.endswith("月份")):
             month_only_dates.extend(ds)
         else:
@@ -219,7 +266,6 @@ def _parse_service_dates(item_name: str, expense_date_str: str) -> Tuple[List[da
     if month_only_dates:
         return sorted(set(month_only_dates)), "service_month_parsed"
 
-    # 没按逗号拆出来，再整体试一次
     whole = _parse_compact_token(normalized, expense_dt)
     if whole:
         src = "service_item_parsed"
@@ -229,25 +275,6 @@ def _parse_service_dates(item_name: str, expense_date_str: str) -> Tuple[List[da
 
     return [], "payment_date"
 
-def infer_level1_category(item_name: str, category_name: str) -> str:
-    text = f"{item_name} {category_name}".strip().lower()
-
-    if any(k in text for k in ["固渣", "渣外运", "渣处理", "污泥", "残渣", "垃圾处理", "外运处置"]):
-        return "固渣处理费"
-
-    if any(k in text for k in ["碳源", "有机酸", "发酵液", "水厂", "污水厂", "制酸", "酸液"]):
-        return "碳源费"
-
-    if any(k in text for k in ["电费", "水费", "能源", "电耗", "水耗"]):
-        return "能源费用"
-
-    if any(k in text for k in ["维修", "检修", "备件", "保养"]):
-        return "维修费用"
-
-    if any(k in text for k in ["运输", "物流", "运费"]):
-        return "运输费"
-
-    return "其他费用"
 
 def parse_purchase_workbook(xlsx_path: str, sheet_names: Optional[List[str]] = None) -> pd.DataFrame:
     xl = pd.ExcelFile(xlsx_path)
@@ -288,28 +315,20 @@ def parse_purchase_workbook(xlsx_path: str, sheet_names: Optional[List[str]] = N
         if "remark" not in body.columns:
             body["remark"] = None
 
-        body["category_name"] = body["category_name"].fillna("其他").astype(str).str.strip().replace({"": "其他"})
-        # body["category_code"] = body["category_name"].map(lambda x: category_lookup.get(x, ("other", "其他费用"))[0])
-        # body["level1_name"] = body["category_name"].map(lambda x: category_lookup.get(x, ("other", "其他费用"))[1])
-        body["level1_name"] = body.apply(
-            lambda r: infer_level1_category(
-                str(r.get("item_name") or ""),
-                str(r.get("category_name") or ""),
-            ),
-            axis=1,
+        body["category_name"] = (
+            body["category_name"]
+            .fillna("其他")
+            .astype(str)
+            .map(_normalize_category_name)
+            .replace({"": "其他"})
         )
 
-        level1_to_code = {
-            "固渣处理费": "slag_disposal",
-            "碳源费": "carbon_source",
-            "能源费用": "energy_cost",
-            "维修费用": "maintenance",
-            "运输费": "transport",
-            "其他费用": "other",
-        }
-
-        body["category_code"] = body["level1_name"].map(level1_to_code).fillna("other")
-    
+        body["category_code"] = body["category_name"].map(
+            lambda x: category_lookup.get(x, ("other", "其他费用"))[0]
+        )
+        body["level1_name"] = body["category_name"].map(
+            lambda x: category_lookup.get(x, ("other", "其他费用"))[1]
+        )
 
         body["expense_date"] = body["expense_date"].dt.strftime("%Y-%m-%d")
         body["expense_month"] = pd.to_datetime(body["expense_date"]).dt.to_period("M").astype(str)
@@ -326,6 +345,7 @@ def parse_purchase_workbook(xlsx_path: str, sheet_names: Optional[List[str]] = N
         body["service_month"] = body["service_dates_list"].map(
             lambda xs: xs[0].strftime("%Y-%m") if xs else None
         )
+
         def _safe_analysis_month(service_month: str | None, expense_month: str) -> str:
             def _ok(s: str | None) -> bool:
                 try:
@@ -346,6 +366,7 @@ def parse_purchase_workbook(xlsx_path: str, sheet_names: Optional[List[str]] = N
             lambda r: _safe_analysis_month(r["service_month"], r["expense_month"]),
             axis=1,
         )
+
         body["service_dates_json"] = body["service_dates_list"].map(
             lambda xs: json.dumps([d.isoformat() for d in xs], ensure_ascii=False)
         )
@@ -353,7 +374,11 @@ def parse_purchase_workbook(xlsx_path: str, sheet_names: Optional[List[str]] = N
             lambda xs: json.dumps(sorted({d.strftime("%Y-%m") for d in xs}), ensure_ascii=False)
         )
 
-        raw_cols = [c for c in ["expense_date", "item_name", "payee", "amount", "category_name", "remark"] if c in body.columns]
+        raw_cols = [
+            c
+            for c in ["expense_date", "item_name", "payee", "amount", "category_name", "remark"]
+            if c in body.columns
+        ]
         body["raw_json"] = body[raw_cols].apply(
             lambda r: json.dumps({k: _clean_value(v) for k, v in r.to_dict().items()}, ensure_ascii=False),
             axis=1,
@@ -380,10 +405,25 @@ def parse_purchase_workbook(xlsx_path: str, sheet_names: Optional[List[str]] = N
         frames.append(
             body[
                 [
-                    "expense_date", "expense_month", "item_name", "payee", "amount", "category_name",
-                    "category_code", "level1_name", "remark", "source_sheet", "source_row_no",
-                    "service_date", "service_month", "analysis_month", "date_source",
-                    "service_dates_json", "service_months_json", "raw_json", "row_hash"
+                    "expense_date",
+                    "expense_month",
+                    "item_name",
+                    "payee",
+                    "amount",
+                    "category_name",
+                    "category_code",
+                    "level1_name",
+                    "remark",
+                    "source_sheet",
+                    "source_row_no",
+                    "service_date",
+                    "service_month",
+                    "analysis_month",
+                    "date_source",
+                    "service_dates_json",
+                    "service_months_json",
+                    "raw_json",
+                    "row_hash",
                 ]
             ]
         )
@@ -394,5 +434,3 @@ def parse_purchase_workbook(xlsx_path: str, sheet_names: Optional[List[str]] = N
     out = pd.concat(frames, ignore_index=True)
     out = out.sort_values(["expense_date", "source_sheet", "source_row_no"]).reset_index(drop=True)
     return out
-
-

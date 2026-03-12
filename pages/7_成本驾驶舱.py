@@ -50,67 +50,33 @@ def safe_div(a, b):
     return a / b
 
 
-def pick_category_col(df: pd.DataFrame) -> str | None:
-    return find_first_existing_col(df, ["category_level1", "level1_name"])
+def normalize_text_series(s: pd.Series) -> pd.Series:
+    return s.fillna("未分类").astype(str).str.strip().replace({"": "未分类"})
 
 
-def normalize_category_names(s: pd.Series) -> pd.Series:
-    x = s.fillna("未分类").astype(str).str.strip()
-
-    def _map(v: str) -> str:
-        v = str(v).strip()
-
-        # 固渣相关
-        if any(k in v for k in [
-            "固渣", "渣料", "渣处理", "污泥", "外运处置", "垃圾外运", "残渣", "渣外运"
-        ]):
-            return "固渣处理费"
-
-        # 碳源 / 有机酸相关
-        if any(k in v for k in [
-            "碳源", "有机酸", "酸液", "发酵液", "制酸", "水厂", "污水厂"
-        ]):
-            return "碳源费"
-
-        # 能源相关
-        if any(k in v for k in [
-            "能源", "电费", "水费", "电", "水"
-        ]):
-            return "能源费用"
-
-        # 维修相关
-        if any(k in v for k in [
-            "维修", "检修", "保养", "备件"
-        ]):
-            return "维修费用"
-
-        return v
-
-    return x.map(_map)
-
-
-def build_focus_category_kpis(cur_cat: pd.DataFrame, period_ton: float) -> dict[str, float]:
-    if cur_cat.empty:
+def build_focus_category_kpis(view_detail_df: pd.DataFrame, period_ton: float) -> dict[str, float]:
+    if view_detail_df.empty:
         return {}
 
-    work = cur_cat.copy()
-    cat_col = pick_category_col(work)
-    if cat_col is None:
+    work = view_detail_df.copy()
+    code_col = find_first_existing_col(work, ["category_code"])
+
+    if code_col is None or "amount" not in work.columns:
         return {}
 
-    work["_cat_norm"] = normalize_category_names(work[cat_col])
-    grouped = work.groupby("_cat_norm", as_index=True)["amount"].sum()
+    grouped = work.groupby(code_col, as_index=True)["amount"].sum()
 
-    focus_map = {
-        "固渣费吨成本": "固渣处理费",
-        "碳源费吨成本": "碳源费",
-        "能源费吨成本": "能源费用",
-        "维修费吨成本": "维修费用",
+    # 对齐 utils.cost_store.CATEGORY_SEED
+    focus_code_map = {
+        "固渣费吨成本": "slag",
+        "碳源费吨成本": "carbon_source",
+        "能源费吨成本": "energy_cost",
+        "维修费吨成本": "repair",
     }
 
     out = {}
-    for label, cat_name in focus_map.items():
-        amt = float(grouped.get(cat_name, 0.0))
+    for label, code in focus_code_map.items():
+        amt = float(grouped.get(code, 0.0))
         out[label] = safe_div(amt, period_ton)
     return out
 
@@ -169,16 +135,16 @@ if is_admin:
                         }
                     )
 
-                    if "level1_name" in preview_df.columns:
-                        lvl = (
-                            preview_df["level1_name"]
-                            .fillna("未分类")
+                    if "category_name" in preview_df.columns:
+                        cat_preview = (
+                            preview_df["category_name"]
+                            .pipe(normalize_text_series)
                             .value_counts(dropna=False)
-                            .rename_axis("一级分类")
+                            .rename_axis("分类")
                             .reset_index(name="条数")
                         )
                         st.markdown("#### 分类预览")
-                        st.dataframe(lvl, use_container_width=True, hide_index=True)
+                        st.dataframe(cat_preview, use_container_width=True, hide_index=True)
 
                 with c2:
                     st.markdown("#### 数据预览（前 20 行）")
@@ -191,6 +157,7 @@ if is_admin:
                             "payee",
                             "amount",
                             "category_name",
+                            "category_code",
                             "level1_name",
                             "remark",
                             "date_source",
@@ -285,7 +252,6 @@ else:
     trend_month_total_df = pd.DataFrame()
     trend_monthly_cat_df = pd.DataFrame()
 
-
 start_date, end_date, date_meta = render_global_sidebar_by_df(
     detail_df.rename(columns={date_col: "date"}),
     date_col="date",
@@ -311,19 +277,33 @@ if month_total_df.empty:
     st.warning("当前筛选区间已读取到成本明细，但未能生成月度汇总。请检查 analysis_month 或金额字段。")
     st.stop()
 
-# 当前区间分类汇总
-cat_col = pick_category_col(monthly_cat_df)
-if cat_col is None:
-    st.warning("当前成本数据缺少一级分类字段（category_level1 / level1_name）。")
+# ============================================================
+# 当前区间分类汇总：按 category_name / category_code 统计细分类
+# ============================================================
+category_name_col = find_first_existing_col(view_detail_df, ["category_name"])
+category_code_col = find_first_existing_col(view_detail_df, ["category_code"])
+
+if category_name_col is None:
+    st.warning("当前成本数据缺少分类字段（category_name）。")
     st.stop()
 
+group_cols = [category_name_col]
+if category_code_col is not None:
+    group_cols = [category_code_col, category_name_col]
+
 cur_cat = (
-    monthly_cat_df.groupby(cat_col, as_index=False)["amount"]
+    view_detail_df.groupby(group_cols, as_index=False)["amount"]
     .sum()
     .sort_values("amount", ascending=False)
     .copy()
 )
-cur_cat = cur_cat.rename(columns={cat_col: "category_level1"})
+
+if category_name_col != "category_name":
+    cur_cat = cur_cat.rename(columns={category_name_col: "category_name"})
+if category_code_col and category_code_col != "category_code" and category_code_col in cur_cat.columns:
+    cur_cat = cur_cat.rename(columns={category_code_col: "category_code"})
+
+cur_cat["category_name"] = normalize_text_series(cur_cat["category_name"])
 total_amount = float(cur_cat["amount"].sum()) if not cur_cat.empty else 0.0
 cur_cat["amount_share"] = cur_cat["amount"] / total_amount if total_amount else 0.0
 
@@ -358,19 +338,8 @@ m4.metric("费用笔数", period_count)
 # ============================================================
 # 重点分类吨成本
 # ============================================================
-focus_kpis = build_focus_category_kpis(cur_cat, period_ton)
+focus_kpis = build_focus_category_kpis(view_detail_df, period_ton)
 st.markdown("### 重点分类吨成本")
-
-diag_cat = cur_cat.copy()
-diag_cat["_归一分类"] = normalize_category_names(diag_cat["category_level1"])
-with st.expander("分类识别诊断", expanded=False):
-    st.dataframe(diag_cat, use_container_width=True, hide_index=True)
-
-# f1, f2, f3, f4 = st.columns(4)
-# f1.metric("运输费吨成本", f"{focus_kpis.get('运输费吨成本', float('nan')):,.2f}" if pd.notna(focus_kpis.get("运输费吨成本")) else "-")
-# f2.metric("能源费吨成本", f"{focus_kpis.get('能源费吨成本', float('nan')):,.2f}" if pd.notna(focus_kpis.get("能源费吨成本")) else "-")
-# f3.metric("维修费吨成本", f"{focus_kpis.get('维修费吨成本', float('nan')):,.2f}" if pd.notna(focus_kpis.get("维修费吨成本")) else "-")
-# f4.metric("固渣费吨成本", f"{focus_kpis.get('固渣费吨成本', float('nan')):,.2f}" if pd.notna(focus_kpis.get("固渣费吨成本")) else "-")
 
 f1, f2, f3, f4 = st.columns(4)
 
@@ -403,16 +372,16 @@ f4.metric(
 )
 
 # ============================================================
-# 一级分类结构
+# 分类结构
 # ============================================================
-st.markdown("### 一级分类结构")
+st.markdown("### 分类结构")
 c1, c2 = st.columns([1.1, 1.2])
 
 with c1:
     if not cur_cat.empty:
         fig = px.pie(
             cur_cat,
-            names="category_level1",
+            names="category_name",
             values="amount",
         )
         st.plotly_chart(polish_fig(fig), use_container_width=True)
@@ -423,14 +392,16 @@ with c2:
     if not cur_cat.empty:
         show_df = cur_cat.copy()
         show_df["amount_share"] = show_df["amount_share"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "-")
-        show_df = show_df.rename(
-            columns={
-                "category_level1": "一级分类",
-                "amount": "金额",
-                "amount_share": "占比",
-            }
-        )
-        st.dataframe(show_df, use_container_width=True, hide_index=True)
+        rename_map = {
+            "category_name": "分类",
+            "amount": "金额",
+            "amount_share": "占比",
+        }
+        if "category_code" in show_df.columns:
+            rename_map["category_code"] = "分类编码"
+        show_df = show_df.rename(columns=rename_map)
+        cols = [c for c in ["分类编码", "分类", "金额", "占比"] if c in show_df.columns]
+        st.dataframe(show_df[cols], use_container_width=True, hide_index=True)
     else:
         st.info("暂无分类明细。")
 
@@ -440,29 +411,9 @@ with c2:
 st.markdown("### 成本结构排序")
 if not cur_cat.empty:
     bar_df = cur_cat.sort_values("amount", ascending=True).copy()
-    fig = px.bar(bar_df, x="amount", y="category_level1", orientation="h")
+    fig = px.bar(bar_df, x="amount", y="category_name", orientation="h")
     fig.update_layout(xaxis_title="金额", yaxis_title="")
     st.plotly_chart(polish_fig(fig), use_container_width=True)
-
-# # ============================================================
-# # 月度趋势
-# # ============================================================
-# st.markdown("### 月度趋势")
-# t1, t2 = st.columns(2)
-
-# with t1:
-#     if not month_total_df.empty:
-#         st.markdown("**月度运营费用**")
-#         fig = px.bar(month_total_df, x="month_label", y="amount")
-#         fig.update_layout(xaxis_title="", yaxis_title="金额")
-#         st.plotly_chart(polish_fig(fig), use_container_width=True)
-
-# with t2:
-#     if not month_total_df.empty:
-#         st.markdown("**吨均运营成本趋势**")
-#         fig = px.line(month_total_df, x="month_label", y="cost_per_ton", markers=True)
-#         fig.update_layout(xaxis_title="", yaxis_title="元/吨")
-#         st.plotly_chart(polish_fig(fig), use_container_width=True)
 
 # ============================================================
 # 月度趋势（固定最近 6 个月）
@@ -484,46 +435,31 @@ with t2:
         fig.update_layout(xaxis_title="", yaxis_title="元/吨")
         st.plotly_chart(polish_fig(fig), use_container_width=True)
 
-# # ============================================================
-# # 一级分类月度趋势
-# # ============================================================
-# st.markdown("### 一级分类月度趋势")
-# if not monthly_cat_df.empty:
-#     month_cat_show = monthly_cat_df.copy()
-#     if cat_col != "category_level1":
-#         month_cat_show = month_cat_show.rename(columns={cat_col: "category_level1"})
-
-#     fig = px.line(
-#         month_cat_show,
-#         x="month_label",
-#         y="amount",
-#         color="category_level1",
-#         markers=True,
-#     )
-#     fig.update_layout(xaxis_title="", yaxis_title="金额")
-#     st.plotly_chart(polish_fig(fig), use_container_width=True)
-
 # ============================================================
-# 一级分类月度趋势（固定最近 6 个月）
+# 分类月度趋势（固定最近 6 个月）
 # ============================================================
-st.markdown("### 一级分类月度趋势（最近 6 个月）")
+st.markdown("### 分类月度趋势（最近 6 个月）")
 if not trend_monthly_cat_df.empty:
     trend_month_cat_show = trend_monthly_cat_df.copy()
-    trend_cat_col = pick_category_col(trend_month_cat_show)
 
-    if trend_cat_col and trend_cat_col != "category_level1":
-        trend_month_cat_show = trend_month_cat_show.rename(columns={trend_cat_col: "category_level1"})
+    trend_cat_name_col = find_first_existing_col(trend_month_cat_show, ["category_name"])
+    if trend_cat_name_col is None:
+        trend_cat_name_col = find_first_existing_col(trend_month_cat_show, ["category_level1", "level1_name"])
 
-    fig = px.line(
-        trend_month_cat_show,
-        x="month_label",
-        y="amount",
-        color="category_level1",
-        markers=True,
-    )
-    fig.update_layout(xaxis_title="", yaxis_title="金额")
-    st.plotly_chart(polish_fig(fig), use_container_width=True)
+    if trend_cat_name_col is not None:
+        if trend_cat_name_col != "category_name":
+            trend_month_cat_show = trend_month_cat_show.rename(columns={trend_cat_name_col: "category_name"})
+        trend_month_cat_show["category_name"] = normalize_text_series(trend_month_cat_show["category_name"])
 
+        fig = px.line(
+            trend_month_cat_show,
+            x="month_label",
+            y="amount",
+            color="category_name",
+            markers=True,
+        )
+        fig.update_layout(xaxis_title="", yaxis_title="金额")
+        st.plotly_chart(polish_fig(fig), use_container_width=True)
 
 # ============================================================
 # 成本异常提示
@@ -534,7 +470,7 @@ a1, a2 = st.columns(2)
 with a1:
     if not cur_cat.empty:
         top_cat = cur_cat.sort_values("amount", ascending=False).iloc[0]
-        st.info(f"当前区间最大成本分类：**{top_cat['category_level1']}**，金额 **{top_cat['amount']:,.0f}** 元。")
+        st.info(f"当前区间最大成本分类：**{top_cat['category_name']}**，金额 **{top_cat['amount']:,.0f}** 元。")
     else:
         st.info("暂无分类数据。")
 
