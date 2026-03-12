@@ -5,7 +5,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import date
-from io import BytesIO
+# from io import BytesIO
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -14,11 +14,18 @@ import plotly.express as px
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
-from utils.paths import get_db_path
+st.set_page_config(page_title="设备健康", layout="wide")
+
 from utils.bootstrap import bootstrap_page
-from utils.device_store import save_device_excel_for_staging, get_published_device_excel_path
-from utils.snapshot import get_active_snapshot_id
 from utils.device_analytics import get_device_fault_ranking
+# from utils.device_store import (
+#     get_published_device_excel_path,
+#     save_device_excel_for_staging,
+# )
+from utils.device_store import get_published_device_excel_path
+from utils.paths import get_db_path
+from utils.sidebar_filters import render_global_sidebar_by_df
+from utils.snapshot import get_active_snapshot_id
 
 
 # ============================================================
@@ -58,7 +65,9 @@ def _norm_date_series(s: pd.Series) -> pd.Series:
 
     try:
         num = pd.to_numeric(s, errors="coerce")
-        out2 = pd.to_datetime("1899-12-30") + pd.to_timedelta(num.fillna(-1).astype("int64"), unit="D")
+        out2 = pd.to_datetime("1899-12-30") + pd.to_timedelta(
+            num.fillna(-1).astype("int64"), unit="D"
+        )
         out2 = out2.where(num.notna(), pd.NaT)
         return out2.dt.normalize()
     except Exception:
@@ -299,7 +308,7 @@ def _calc_downtime_hours(df: pd.DataFrame) -> pd.Series:
             end_col = c
             break
 
-    if start_col and end_col:
+    if start_col and end_col and "日期" in df.columns:
         start_dt = _to_dt_with_date(df["日期"], df[start_col])
         end_dt = _to_dt_with_date(df["日期"], df[end_col])
         delta = (end_dt - start_dt).dt.total_seconds() / 3600.0
@@ -341,7 +350,9 @@ def _normalize_fault_df(df: pd.DataFrame) -> pd.DataFrame:
     df["系统"] = df["设备id"].apply(_infer_system_from_eid) if "设备id" in df.columns else "其他"
 
     stop_col = _find_col(df, ["是否停机（是/否）", "是否停机", "停机", "是否停机?"])
-    df["是否停机"] = df[stop_col].astype(str).str.strip().replace({"nan": "", "None": ""}) if stop_col else ""
+    df["是否停机"] = (
+        df[stop_col].astype(str).str.strip().replace({"nan": "", "None": ""}) if stop_col else ""
+    )
 
     cat_col = _find_col(df, ["异常类别（下拉选择）", "异常类别", "故障类别", "类别"])
     df["异常类别"] = df[cat_col] if cat_col else ""
@@ -486,7 +497,6 @@ def _overlay_faults_level(eid: str, faults_in_range: pd.DataFrame) -> int:
         sf = f[stop_mask].copy()
         latest = sf.sort_values("日期", ascending=False).head(1)
         end_dt = latest["_end_dt"].iloc[0]
-
         if pd.isna(end_dt):
             return 3
         return 2
@@ -503,7 +513,9 @@ def _find_equip_by_id(equip: pd.DataFrame, eid: str) -> Optional[pd.Series]:
     return hit.iloc[0]
 
 
-def _find_equip_by_name_like(equip: pd.DataFrame, keyword: str, extra_pattern: Optional[str] = None) -> Optional[pd.Series]:
+def _find_equip_by_name_like(
+    equip: pd.DataFrame, keyword: str, extra_pattern: Optional[str] = None
+) -> Optional[pd.Series]:
     if equip is None or equip.empty:
         return None
     kw = keyword.strip()
@@ -648,7 +660,6 @@ def display_label(x: NodeResolved) -> str:
 # ============================================================
 # Streamlit page
 # ============================================================
-st.set_page_config(page_title="设备健康", layout="wide")
 st.title("🧭 设备健康（控制塔）")
 st.caption("按工艺流程展示关键设备状态（预处理2线 / 水解酸化4线 / 离心过滤 / 除臭）")
 
@@ -659,203 +670,106 @@ if DEBUG:
         st.sidebar.caption("DEBUG(secrets) raw: <no secrets>")
 
 
-# ------------------------------------------------------------
-# Sidebar containers
-# ------------------------------------------------------------
-time_box = st.sidebar.container()
-filter_box = st.sidebar.container()
-data_box = st.sidebar.container()
+# # ------------------------------------------------------------
+# # Data source: role-aware
+# # ------------------------------------------------------------
+# if "device_uploaded_bytes" not in st.session_state:
+#     st.session_state.device_uploaded_bytes = b""
+# if "device_uploaded_name" not in st.session_state:
+#     st.session_state.device_uploaded_name = "uploaded.xlsx"
 
+# st.sidebar.divider()
+# st.sidebar.markdown("## ⚙️ 数据源")
 
-# ------------------------------------------------------------
-# Data source: role-aware
-# ------------------------------------------------------------
-if "device_uploaded_bytes" not in st.session_state:
-    st.session_state.device_uploaded_bytes = b""
-if "device_uploaded_name" not in st.session_state:
-    st.session_state.device_uploaded_name = "uploaded.xlsx"
+# is_admin = getattr(user, "role", "") == "admin"
 
-with data_box:
-    st.divider()
-    st.markdown("## ⚙️ 数据源")
+# if is_admin:
+#     device_view_mode = st.sidebar.radio(
+#         "查看版本",
+#         ["已发布数据", "草稿（本次上传预览）"],
+#         horizontal=True,
+#         key="device_view_mode",
+#     )
+#     uploaded = st.sidebar.file_uploader("上传设备记录表（xlsx）", type=["xlsx"], key="device_uploader")
+#     st.sidebar.caption("要求：包含工作表「异常记录」以及设备台账 Sheets（预处理/水解酸化/除臭/车间基础）。")
+#     if uploaded is not None:
+#         try:
+#             save_device_excel_for_staging(DB_PATH, uploaded.getbuffer())
+#             st.sidebar.success("✅ 已保存到草稿快照（staging）。发布后厂长可见。")
+#         except Exception as e:
+#             st.sidebar.error(f"保存到草稿快照失败：{e}")
 
-    is_admin = getattr(user, "role", "") == "admin"
-
-    if is_admin:
-        device_view_mode = st.radio(
-            "查看版本",
-            ["已发布数据", "草稿（本次上传预览）"],
-            horizontal=True,
-            key="device_view_mode",
-        )
-        uploaded = st.file_uploader("上传设备记录表（xlsx）", type=["xlsx"], key="device_uploader")
-        st.caption("要求：包含工作表「异常记录」以及设备台账 Sheets（预处理/水解酸化/除臭/车间基础）。")
-        if uploaded is not None:
-            try:
-                save_device_excel_for_staging(DB_PATH, uploaded.getbuffer())
-                st.success("✅ 已保存到草稿快照（staging）。发布后厂长可见。")
-            except Exception as e:
-                st.error(f"保存到草稿快照失败：{e}")
-
-            st.session_state.device_uploaded_name = uploaded.name
-            st.session_state.device_uploaded_bytes = uploaded.getvalue()
-            st.session_state.device_view_mode = "草稿（本次上传预览）"
-            st.rerun()
-    else:
-        device_view_mode = "已发布数据"
-        st.info("你是查看者账号：仅可查看「已发布数据」。")
+#         st.session_state.device_uploaded_name = uploaded.name
+#         st.session_state.device_uploaded_bytes = uploaded.getvalue()
+#         st.session_state.device_view_mode = "草稿（本次上传预览）"
+#         st.rerun()
+# else:
+#     device_view_mode = "已发布数据"
+#     st.sidebar.info("你是查看者账号：仅可查看「已发布数据」。")
 
 
 # ------------------------------------------------------------
 # Load equipment + faults according to mode
 # ------------------------------------------------------------
+# equip = pd.DataFrame()
+# faults = pd.DataFrame()
+
+# if device_view_mode == "草稿（本次上传预览）":
+#     b = st.session_state.get("device_uploaded_bytes", b"")
+#     n = st.session_state.get("device_uploaded_name", "uploaded.xlsx")
+#     if b:
+#         equip, faults = load_all_data_from_bytes(n, b)
+#     else:
+#         equip, faults = pd.DataFrame(), pd.DataFrame()
+# else:
+#     p = get_published_device_excel_path(DB_PATH)
+#     if p:
+#         equip, faults = load_all_data_from_path(p)
+#     else:
+#         equip, faults = pd.DataFrame(), pd.DataFrame()
+
 equip = pd.DataFrame()
 faults = pd.DataFrame()
 
-if device_view_mode == "草稿（本次上传预览）":
-    b = st.session_state.get("device_uploaded_bytes", b"")
-    n = st.session_state.get("device_uploaded_name", "uploaded.xlsx")
-    if b:
-        equip, faults = load_all_data_from_bytes(n, b)
-    else:
-        equip, faults = pd.DataFrame(), pd.DataFrame()
+# 设备健康页统一只读“已发布数据”
+p = get_published_device_excel_path(DB_PATH)
+if p:
+    equip, faults = load_all_data_from_path(p)
 else:
-    p = get_published_device_excel_path(DB_PATH)
-    if p:
-        equip, faults = load_all_data_from_path(p)
-    else:
-        equip, faults = pd.DataFrame(), pd.DataFrame()
+    equip, faults = pd.DataFrame(), pd.DataFrame()
 
 
 # ------------------------------------------------------------
 # If no data
 # ------------------------------------------------------------
 if equip.empty and faults.empty:
-    with time_box:
-        st.markdown("## 🕒 时间选择")
-        st.info("没有可用的设备健康数据：请管理员上传设备记录表，并在首页/管理页发布后再查看。")
-
-    with filter_box:
-        st.divider()
-        show_raw = st.checkbox("显示原始明细表", value=False, key="dev_show_raw")
-        system_filter = []
-
-    st.warning("未加载到设备健康数据。")
+    st.warning("未加载到设备健康数据。请管理员上传设备记录表，并在首页/管理页发布后再查看。")
     st.stop()
 
 
 # ------------------------------------------------------------
-# Time bounds
+# Build sidebar date source
+# 规则：
+# - 优先用 faults 的日期做时间范围
+# - 如果 faults 为空，则给一个今天的占位日期，页面依然能打开
 # ------------------------------------------------------------
 if not faults.empty and "日期" in faults.columns:
-    date_min = faults["日期"].dt.date.min()
-    date_max = faults["日期"].dt.date.max()
+    sidebar_df = faults[["日期"]].rename(columns={"日期": "date"}).copy()
 else:
-    date_min = date.today()
-    date_max = date.today()
+    sidebar_df = pd.DataFrame({"date": [pd.Timestamp.today().normalize()]})
 
-months = []
-if not faults.empty and "日期" in faults.columns:
-    months = sorted(faults["日期"].dt.to_period("M").astype(str).unique().tolist())
+start_date, end_date, date_meta = render_global_sidebar_by_df(sidebar_df, date_col="date")
+st.caption(f"当前筛选区间：{date_meta['label']}")
 
-
-# ------------------------------------------------------------
-# Session state init
-# ------------------------------------------------------------
-if "dev_start_date" not in st.session_state:
-    st.session_state.dev_start_date = max(date_min, (pd.Timestamp(date_max) - pd.Timedelta(days=30)).date())
-
-if "dev_end_date" not in st.session_state:
-    st.session_state.dev_end_date = date_max
-
-if "dev_month_pick" not in st.session_state:
-    st.session_state.dev_month_pick = "自定义"
-
-
-def clamp_date(d: date) -> date:
-    return min(max(d, date_min), date_max)
-
-
-def apply_month_range(m: str) -> None:
-    first = pd.Period(m).start_time.date()
-    last = pd.Period(m).end_time.date()
-    st.session_state.dev_start_date = clamp_date(first)
-    st.session_state.dev_end_date = clamp_date(last)
-
-
-def month_from_start() -> str:
-    return pd.Timestamp(st.session_state.dev_start_date).to_period("M").strftime("%Y-%m")
-
-
-def set_month_range_from_selectbox() -> None:
-    m = st.session_state.dev_month_pick
-    if m == "自定义":
-        return
-    apply_month_range(m)
-
-
-with time_box:
-    st.markdown("## 🕒 时间选择")
-
-    if months:
-        cur_m = month_from_start()
-        st.selectbox(
-            "快捷月份",
-            options=["自定义"] + months,
-            key="dev_month_pick",
-            on_change=set_month_range_from_selectbox,
-        )
-        st.caption(f"当前：{cur_m}")
-
-        cA, cB = st.columns(2)
-        with cA:
-            if st.button("◀ 上一月", use_container_width=True, key="dev_btn_prev_month"):
-                if cur_m in months:
-                    i = months.index(cur_m)
-                    if i > 0:
-                        apply_month_range(months[i - 1])
-                        st.rerun()
-        with cB:
-            if st.button("下一月 ▶", use_container_width=True, key="dev_btn_next_month"):
-                if cur_m in months:
-                    i = months.index(cur_m)
-                    if i < len(months) - 1:
-                        apply_month_range(months[i + 1])
-                        st.rerun()
-    else:
-        st.caption("异常记录为空：仅提供自定义日期。")
-
-    st.divider()
-
-    start_date = st.date_input(
-        "开始日期",
-        min_value=date_min,
-        max_value=date_max,
-        key="dev_start_date",
-    )
-    end_date = st.date_input(
-        "结束日期",
-        min_value=date_min,
-        max_value=date_max,
-        key="dev_end_date",
-    )
-
-    if start_date > end_date:
-        start_date, end_date = end_date, start_date
-        st.session_state.dev_start_date = start_date
-        st.session_state.dev_end_date = end_date
-
-
-with filter_box:
-    st.divider()
-    show_raw = st.checkbox("显示原始明细表", value=False, key="dev_show_raw")
-    system_opts = sorted(faults["系统"].unique().tolist()) if (not faults.empty and "系统" in faults.columns) else []
-    system_filter = st.multiselect(
-        "系统筛选（用于统计/明细）",
-        options=system_opts,
-        default=system_opts,
-        key="dev_system_filter",
-    )
+st.sidebar.divider()
+show_raw = st.sidebar.checkbox("显示原始明细表", value=False, key="dev_show_raw")
+system_opts = sorted(faults["系统"].dropna().unique().tolist()) if (not faults.empty and "系统" in faults.columns) else []
+system_filter = st.sidebar.multiselect(
+    "系统筛选（用于统计/明细）",
+    options=system_opts,
+    default=system_opts,
+    key="dev_system_filter",
+)
 
 
 # ------------------------------------------------------------
@@ -1109,17 +1023,22 @@ with c3:
     render_list(items)
 
 with st.expander("🧩 节点映射诊断（建议首次上线先看一眼）", expanded=False):
-    diag = pd.DataFrame([{
-        "区块": x.block,
-        "线别": x.line,
-        "节点": x.node,
-        "显示名": display_label(x),
-        "状态": f"{LEVEL_EMOJI[x.final_level]} {LEVEL_TEXT[x.final_level]}",
-        "匹配规则": x.match_rule,
-        "设备id": x.equip_id,
-        "设备名称": x.equip_name,
-        "台账状态": x.base_status_text,
-    } for x in tower_nodes])
+    diag = pd.DataFrame(
+        [
+            {
+                "区块": x.block,
+                "线别": x.line,
+                "节点": x.node,
+                "显示名": display_label(x),
+                "状态": f"{LEVEL_EMOJI[x.final_level]} {LEVEL_TEXT[x.final_level]}",
+                "匹配规则": x.match_rule,
+                "设备id": x.equip_id,
+                "设备名称": x.equip_name,
+                "台账状态": x.base_status_text,
+            }
+            for x in tower_nodes
+        ]
+    )
     st.dataframe(diag, use_container_width=True, hide_index=True)
 
     missing = diag[(diag["设备id"] == "") & (diag["设备名称"] == "")]
@@ -1153,16 +1072,19 @@ else:
     total_events = int(len(dff))
     unique_devices = int(dff["设备id"].nunique()) if "设备id" in dff.columns else 0
 
-    stop_mask = dff["是否停机"].astype(str).str.contains("是", na=False) if "是否停机" in dff.columns else pd.Series([False] * len(dff), index=dff.index)
+    stop_mask = (
+        dff["是否停机"].astype(str).str.contains("是", na=False)
+        if "是否停机" in dff.columns
+        else pd.Series([False] * len(dff), index=dff.index)
+    )
     stop_df = dff[stop_mask].copy()
 
-    # 只汇总真正算得出时长的停机记录
     downtime_hours_sum = (
         float(pd.to_numeric(stop_df["停机小时"], errors="coerce").dropna().sum())
-        if "停机小时" in stop_df.columns else 0.0
+        if "停机小时" in stop_df.columns
+        else 0.0
     )
 
-    # 完整率：停机记录中，可计算时长的占比
     if len(stop_df) > 0 and "停机小时" in stop_df.columns:
         completeness = float(pd.to_numeric(stop_df["停机小时"], errors="coerce").notna().mean())
     else:
@@ -1177,22 +1099,31 @@ else:
     st.divider()
 
     cA, cB = st.columns([2, 1])
+
     daily = dff.groupby(dff["日期"].dt.date).size().reset_index(name="异常次数")
     daily.columns = ["日期", "异常次数"]
-    fig_trend = px.line(daily, x="日期", y="异常次数", markers=True, title="异常趋势（按天）")
+    fig_trend = px.line(daily, x="日期", y="异常次数", markers=True)
+    fig_trend.update_layout(xaxis_title="", yaxis_title="次数")
+    cA.markdown("**异常趋势（按天）**")
     cA.plotly_chart(fig_trend, use_container_width=True)
 
     sys_cnt = dff.groupby("系统").size().reset_index(name="异常次数").sort_values("异常次数", ascending=False)
-    fig_sys = px.bar(sys_cnt, x="系统", y="异常次数", title="系统分布（异常次数）")
+    fig_sys = px.bar(sys_cnt, x="系统", y="异常次数")
+    fig_sys.update_layout(xaxis_title="", yaxis_title="次数")
+    cB.markdown("**系统分布（异常次数）**")
     cB.plotly_chart(fig_sys, use_container_width=True)
 
     st.divider()
 
-    grp = dff.groupby(["设备id", "设备名称", "系统"], dropna=False).agg(
-        异常次数=("日期", "count"),
-        停机总时长小时=("停机小时", lambda x: float(pd.to_numeric(x, errors="coerce").dropna().sum())),
-        最近一次异常=("日期", "max"),
-    ).reset_index()
+    grp = (
+        dff.groupby(["设备id", "设备名称", "系统"], dropna=False)
+        .agg(
+            异常次数=("日期", "count"),
+            停机总时长小时=("停机小时", lambda x: float(pd.to_numeric(x, errors="coerce").dropna().sum())),
+            最近一次异常=("日期", "max"),
+        )
+        .reset_index()
+    )
 
     grp["最近一次异常"] = pd.to_datetime(grp["最近一次异常"], errors="coerce").dt.strftime("%Y-%m-%d")
     top10 = grp.sort_values(["异常次数", "停机总时长小时"], ascending=[False, False]).head(10).copy()
@@ -1204,9 +1135,19 @@ else:
     if show_raw:
         st.subheader("📄 原始明细（过滤后）")
         preferred = [
-            "日期", "系统", "设备id", "设备名称", "异常类别",
-            "异常描述", "是否停机", "_start_dt", "_end_dt",
-            "停机小时", "处理措施", "图片路径/链接", "记录人"
+            "日期",
+            "系统",
+            "设备id",
+            "设备名称",
+            "异常类别",
+            "异常描述",
+            "是否停机",
+            "_start_dt",
+            "_end_dt",
+            "停机小时",
+            "处理措施",
+            "图片路径/链接",
+            "记录人",
         ]
         cols = [c for c in preferred if c in dff.columns]
         rest = [c for c in dff.columns if c not in cols and not c.startswith("_")]
