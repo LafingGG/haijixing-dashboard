@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
@@ -67,10 +67,16 @@ def _apply_month(month_str: str, min_date: date, max_date: date) -> None:
     st.session_state.global_end_date = end
 
 
+def _render_sidebar_title(title: Optional[str]) -> None:
+    if title and str(title).strip():
+        st.sidebar.markdown(f"## {title}")
+        st.sidebar.markdown("---")
+
+
 def render_global_sidebar_by_df(
     df: pd.DataFrame,
     date_col: str = "date",
-    title: str = "海吉星运营驾驶舱",
+    title: Optional[str] = None,
     show_data_hint: bool = True,
 ) -> Tuple[date, date, Dict[str, str]]:
     """
@@ -80,8 +86,7 @@ def render_global_sidebar_by_df(
         start_date, end_date, meta
     """
     if df is None or df.empty or date_col not in df.columns:
-        st.sidebar.markdown(f"## {title}")
-        st.sidebar.markdown("---")
+        _render_sidebar_title(title)
         st.sidebar.warning("当前页面暂无可用日期数据")
         today = date.today()
         meta = {
@@ -96,8 +101,7 @@ def render_global_sidebar_by_df(
     tmp = tmp.dropna(subset=[date_col]).sort_values(date_col)
 
     if tmp.empty:
-        st.sidebar.markdown(f"## {title}")
-        st.sidebar.markdown("---")
+        _render_sidebar_title(title)
         st.sidebar.warning("当前页面暂无有效日期数据")
         today = date.today()
         meta = {
@@ -121,8 +125,6 @@ def render_global_sidebar_by_df(
 
     valid_options = ["自定义"] + months
 
-    # 这个 key 只给 selectbox 当 widget key 用
-    # 每轮在 widget 创建前，根据当前日期区间决定默认显示值
     st.session_state["global_month_pick_widget"] = (
         inferred_month_pick if inferred_month_pick in valid_options else "自定义"
     )
@@ -132,8 +134,7 @@ def render_global_sidebar_by_df(
         if picked != "自定义":
             _apply_month(picked, min_date, max_date)
 
-    st.sidebar.markdown(f"## {title}")
-    st.sidebar.markdown("---")
+    _render_sidebar_title(title)
     st.sidebar.markdown("### 📅 时间范围")
 
     st.sidebar.selectbox(

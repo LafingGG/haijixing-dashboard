@@ -8,7 +8,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-st.set_page_config(page_title="成本驾驶舱", page_icon="💰", layout="wide")
+st.set_page_config(page_title="成本分析", page_icon="💰", layout="wide")
 
 from etl.parse_purchase_excel import parse_purchase_workbook
 from utils.bootstrap import bootstrap_page
@@ -83,7 +83,7 @@ def build_focus_category_kpis(view_detail_df: pd.DataFrame, period_ton: float) -
 db_path = get_db_path()
 user = bootstrap_page(db_path)
 
-st.title("💰 成本驾驶舱")
+st.title("💰 成本分析")
 st.caption("基于采购付款明细，按当前筛选区间分析成本结构、月度趋势与吨均成本。")
 
 snapshot_id = get_active_snapshot_id(db_path)
