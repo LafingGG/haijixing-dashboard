@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from utils.config import get_bucket_to_ton
 from utils.snapshot import ensure_snapshot_schema, get_active_snapshot_id
 
 
@@ -26,6 +27,16 @@ OPS_NUMERIC_COLUMNS: tuple[str, ...] = (
     "to_wwtp_m3",
     "wwtp_flow_m3",
     "arrive_wwtp_m3",
+    "incoming_bucket_count",
+    "line1_feed_bucket_count",
+    "line1_slag_bucket_count",
+    "line2_feed_bucket_count",
+    "line2_slag_bucket_count",
+    "compress_bucket_count",
+    "centrifuge_meter_m3",
+    "centrifuge_feed_m3",
+    "line1_runtime_hours",
+    "line2_runtime_hours",
 )
 
 
@@ -61,6 +72,20 @@ def load_daily_ops_data(db_path: str, snapshot_id: Optional[str] = None) -> pd.D
 
     if "slag_total_ton" not in df.columns and "slag_ton" in df.columns:
         df["slag_total_ton"] = df["slag_ton"]
+
+    bucket_to_ton = get_bucket_to_ton()
+    if "incoming_bucket_count" in df.columns and "incoming_bucket_ton" not in df.columns:
+        df["incoming_bucket_ton"] = df["incoming_bucket_count"] * bucket_to_ton
+    if "compress_bucket_count" in df.columns and "compress_bucket_ton" not in df.columns:
+        df["compress_bucket_ton"] = df["compress_bucket_count"] * bucket_to_ton
+    if "line1_feed_bucket_count" in df.columns and "line1_feed_bucket_ton" not in df.columns:
+        df["line1_feed_bucket_ton"] = df["line1_feed_bucket_count"] * bucket_to_ton
+    if "line2_feed_bucket_count" in df.columns and "line2_feed_bucket_ton" not in df.columns:
+        df["line2_feed_bucket_ton"] = df["line2_feed_bucket_count"] * bucket_to_ton
+    if "line1_slag_bucket_count" in df.columns and "line1_slag_bucket_ton" not in df.columns:
+        df["line1_slag_bucket_ton"] = df["line1_slag_bucket_count"] * bucket_to_ton
+    if "line2_slag_bucket_count" in df.columns and "line2_slag_bucket_ton" not in df.columns:
+        df["line2_slag_bucket_ton"] = df["line2_slag_bucket_count"] * bucket_to_ton
 
     return df
 
@@ -117,7 +142,9 @@ def get_valid_production_records(df: pd.DataFrame) -> pd.DataFrame:
         return df.copy()
     incoming = df["incoming_ton"].fillna(0) if "incoming_ton" in df.columns else 0
     slag = df["slag_ton"].fillna(0) if "slag_ton" in df.columns else 0
-    return df[(incoming > 0) | (slag > 0)].copy()
+    bucket = df["incoming_bucket_count"].fillna(0) if "incoming_bucket_count" in df.columns else 0
+    centrifuge = df["centrifuge_feed_m3"].fillna(0) if "centrifuge_feed_m3" in df.columns else 0
+    return df[(incoming > 0) | (slag > 0) | (bucket > 0) | (centrifuge > 0)].copy()
 
 
 def is_valid_month_str(x: str) -> bool:

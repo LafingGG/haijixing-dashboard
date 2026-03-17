@@ -7,6 +7,7 @@ import streamlit as st
 st.set_page_config(page_title="运行分析", page_icon="📈", layout="wide")
 
 from utils.bootstrap import bootstrap_page
+from utils.config import get_bucket_to_ton
 from utils.sidebar_filters import render_global_sidebar_by_df
 from utils.paths import get_db_path
 from utils.snapshot import get_active_snapshot_id
@@ -31,11 +32,18 @@ def polish_fig(fig):
     return fig
 
 
+def has_series(df, cols: list[str]) -> bool:
+    for c in cols:
+        if c in df.columns and df[c].notna().sum() > 0:
+            return True
+    return False
+
+
 db_path = get_db_path()
 bootstrap_page(db_path)
 
 st.title("📈 运行分析")
-st.caption("整合处理量、出渣率、水耗、电耗，作为运行管理的核心分析页。")
+st.caption(f"整合处理量、出渣率、水耗、电耗，并叠加双线桶数与离心机真实产出。当前按 1 桶 ≈ {get_bucket_to_ton():.2f} 吨换算。")
 
 snapshot_id = get_active_snapshot_id(db_path)
 
@@ -66,9 +74,9 @@ if view_df.empty:
 summary = summarize_ops_period(view_df)
 stability, reasons = judge_process_stability(view_df)
 
-m1, m2, m3, m4, m5 = st.columns(5)
+m1, m2, m3, m4, m5, m6 = st.columns(6)
 m1.metric("处理量（吨）", f"{summary['incoming_ton']:.1f}")
-m2.metric("出渣量（吨）", f"{summary['slag_total_ton']:.1f}")
+m2.metric("来料（桶）", f"{summary['incoming_bucket_count']:.0f}")
 m3.metric(
     "平均出渣率",
     f"{summary['avg_slag_rate']:.1%}"
@@ -76,16 +84,40 @@ m3.metric(
     else "-",
 )
 m4.metric(
+    "真实浆料产出（m³）",
+    f"{summary['actual_slurry_m3']:.1f}",
+)
+m5.metric(
+    "浆料产出强度（m³/吨）",
+    f"{summary['avg_slurry_per_ton']:.2f}"
+    if summary["avg_slurry_per_ton"] == summary["avg_slurry_per_ton"]
+    else "-",
+)
+m6.metric(
+    "压缩箱累计（桶）",
+    f"{view_df['compress_bucket_count'].fillna(0).sum():.0f}" if "compress_bucket_count" in view_df.columns else "-",
+)
+
+n1, n2, n3, n4 = st.columns(4)
+n1.metric(
     "平均单吨水耗",
     f"{summary['avg_water_per_ton']:.2f}"
     if summary["avg_water_per_ton"] == summary["avg_water_per_ton"]
     else "-",
 )
-m5.metric(
+n2.metric(
     "平均单吨电耗",
     f"{summary['avg_elec_per_ton']:.2f}"
     if summary["avg_elec_per_ton"] == summary["avg_elec_per_ton"]
     else "-",
+)
+n3.metric(
+    "1线平均效率（吨/小时）",
+    f"{summary['line1_avg_tph']:.2f}" if summary["line1_avg_tph"] == summary["line1_avg_tph"] else "-",
+)
+n4.metric(
+    "2线平均效率（吨/小时）",
+    f"{summary['line2_avg_tph']:.2f}" if summary["line2_avg_tph"] == summary["line2_avg_tph"] else "-",
 )
 
 st.markdown("### 工艺稳定性判断")
@@ -99,6 +131,12 @@ else:
 for reason in reasons:
     st.caption(f"• {reason}")
 
+if "compress_warning" in view_df.columns and view_df["compress_warning"].fillna(False).any():
+    latest_warn = view_df.loc[view_df["compress_warning"].fillna(False), ["date", "compress_bucket_count", "compress_bucket_diff"]].tail(1)
+    if not latest_warn.empty:
+        row = latest_warn.iloc[-1]
+        st.warning(f"压缩箱存在积压迹象：{row['date'].date()} 当日较前一日增加 {row['compress_bucket_diff']:.0f} 桶。")
+
 st.markdown("### 日趋势")
 t1, t2 = st.columns(2)
 
@@ -109,24 +147,56 @@ with t1:
     st.plotly_chart(polish_fig(fig), use_container_width=True)
 
 with t2:
-    st.markdown("**出渣率**")
-    fig = px.line(view_df, x="date", y="slag_rate", markers=True)
-    fig.update_layout(xaxis_title="", yaxis_title="出渣率", yaxis_tickformat=".0%")
+    st.markdown("**真实浆料产出（m³）**")
+    fig = px.line(view_df, x="date", y="actual_slurry_m3", markers=True)
+    fig.update_layout(xaxis_title="", yaxis_title="m³")
     st.plotly_chart(polish_fig(fig), use_container_width=True)
 
 t3, t4 = st.columns(2)
 
 with t3:
+    st.markdown("**出渣率**")
+    fig = px.line(view_df, x="date", y="slag_rate", markers=True)
+    fig.update_layout(xaxis_title="", yaxis_title="出渣率", yaxis_tickformat=".0%")
+    st.plotly_chart(polish_fig(fig), use_container_width=True)
+
+with t4:
+    st.markdown("**浆料产出强度（m³/吨）**")
+    fig = px.line(view_df, x="date", y="slurry_per_ton", markers=True)
+    fig.update_layout(xaxis_title="", yaxis_title="m³/吨")
+    st.plotly_chart(polish_fig(fig), use_container_width=True)
+
+u1, u2 = st.columns(2)
+with u1:
     st.markdown("**单吨水耗（m³/吨）**")
     fig = px.line(view_df, x="date", y="water_per_ton", markers=True)
     fig.update_layout(xaxis_title="", yaxis_title="m³/吨")
     st.plotly_chart(polish_fig(fig), use_container_width=True)
 
-with t4:
+with u2:
     st.markdown("**单吨电耗（kWh/吨）**")
     fig = px.line(view_df, x="date", y="elec_per_ton", markers=True)
     fig.update_layout(xaxis_title="", yaxis_title="kWh/吨")
     st.plotly_chart(polish_fig(fig), use_container_width=True)
+
+if has_series(view_df, ["line1_feed_bucket_count", "line2_feed_bucket_count"]):
+    st.markdown("### 双线对比")
+    l1, l2 = st.columns(2)
+    with l1:
+        fig = px.bar(
+            view_df,
+            x="date",
+            y=[c for c in ["line1_feed_bucket_count", "line2_feed_bucket_count"] if c in view_df.columns],
+            barmode="group",
+        )
+        fig.update_layout(xaxis_title="", yaxis_title="桶")
+        st.plotly_chart(polish_fig(fig), use_container_width=True)
+    with l2:
+        eff_cols = [c for c in ["line1_feed_tph", "line2_feed_tph"] if c in view_df.columns]
+        if eff_cols:
+            fig = px.line(view_df, x="date", y=eff_cols, markers=True)
+            fig.update_layout(xaxis_title="", yaxis_title="吨/小时")
+            st.plotly_chart(polish_fig(fig), use_container_width=True)
 
 st.markdown("### 月度趋势")
 monthly_df = build_monthly_ops_summary(view_df)
@@ -140,9 +210,9 @@ if not monthly_df.empty:
         st.plotly_chart(polish_fig(fig), use_container_width=True)
 
     with a2:
-        st.markdown("**月度平均出渣率**")
-        fig = px.line(monthly_df, x="month_label", y="slag_rate", markers=True)
-        fig.update_layout(xaxis_title="", yaxis_title="出渣率", yaxis_tickformat=".0%")
+        st.markdown("**月度真实浆料产出**")
+        fig = px.bar(monthly_df, x="month_label", y="actual_slurry_m3")
+        fig.update_layout(xaxis_title="", yaxis_title="m³")
         st.plotly_chart(polish_fig(fig), use_container_width=True)
 
     a3, a4 = st.columns(2)
@@ -165,6 +235,18 @@ show_cols = [
         "date",
         "incoming_trips",
         "incoming_ton",
+        "incoming_bucket_count",
+        "line1_feed_bucket_count",
+        "line1_slag_bucket_count",
+        "line2_feed_bucket_count",
+        "line2_slag_bucket_count",
+        "compress_bucket_count",
+        "centrifuge_feed_m3",
+        "actual_slurry_m3",
+        "line1_runtime_hours",
+        "line2_runtime_hours",
+        "line1_feed_tph",
+        "line2_feed_tph",
         "slag_trips",
         "slag_ton",
         "slag_total_ton",
@@ -173,7 +255,7 @@ show_cols = [
         "slag_rate",
         "water_per_ton",
         "elec_per_ton",
-        "slurry_m3",
+        "slurry_per_ton",
         "to_wwtp_m3",
         "arrive_wwtp_m3",
         "wwtp_gap_m3",
