@@ -12,7 +12,7 @@ import streamlit as st
 st.set_page_config(page_title="物料平衡 | 海吉星果蔬项目", layout="wide")
 
 from utils.bootstrap import bootstrap_page
-from utils.config import load_thresholds
+from utils.config import load_thresholds, get_bucket_to_ton
 from utils.definitions import DEFINITIONS_MD
 from utils.paths import get_db_path
 from utils.sidebar_filters import render_global_sidebar_by_df
@@ -87,6 +87,7 @@ def load_data() -> pd.DataFrame:
 
 
 st.title("物料平衡")
+st.caption(f"桶数按 1 桶 ≈ {get_bucket_to_ton():.2f} 吨换算，仅用于运营分析口径。")
 
 with st.expander("📌口径说明", expanded=False):
     st.markdown(DEFINITIONS_MD)
@@ -97,6 +98,11 @@ if df.empty:
     st.stop()
 
 df["date"] = pd.to_datetime(df["date"])
+for col in [
+    "incoming_ton", "slag_total_ton", "incoming_bucket_count", "compress_bucket_count", "centrifuge_feed_m3"
+]:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
 start_date, end_date, date_meta = render_global_sidebar_by_df(df, date_col="date")
 st.caption(f"当前筛选区间：{date_meta['label']}")
@@ -110,23 +116,45 @@ if dfr.empty:
     st.warning("当前筛选区间内无数据，请调整侧边栏时间范围。")
     st.stop()
 
-incoming = float(dfr["incoming_ton"].sum(skipna=True))
-slag = float(dfr["slag_total_ton"].sum(skipna=True))
+incoming = float(dfr["incoming_ton"].sum(skipna=True)) if "incoming_ton" in dfr.columns else 0.0
+slag = float(dfr["slag_total_ton"].sum(skipna=True)) if "slag_total_ton" in dfr.columns else 0.0
+incoming_bucket = float(dfr["incoming_bucket_count"].sum(skipna=True)) if "incoming_bucket_count" in dfr.columns else 0.0
+compress_bucket = float(dfr["compress_bucket_count"].sum(skipna=True)) if "compress_bucket_count" in dfr.columns else 0.0
+centrifuge_feed = float(dfr["centrifuge_feed_m3"].sum(skipna=True)) if "centrifuge_feed_m3" in dfr.columns else 0.0
 rate = np.nan if incoming == 0 else slag / incoming
+slurry_rate = np.nan if incoming == 0 else centrifuge_feed / incoming
 
-k1, k2, k3 = st.columns(3)
+k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("来料(吨)", f"{incoming:,.0f}")
 k2.metric("出渣合计(吨)", f"{slag:,.0f}")
-k3.metric("出渣率(吨/吨)", "-" if np.isnan(rate) else f"{rate:.3f}")
+k3.metric("来料(桶)", f"{incoming_bucket:,.0f}")
+k4.metric("离心机真实产出(m³)", f"{centrifuge_feed:,.0f}")
+k5.metric("出渣率(吨/吨)", "-" if np.isnan(rate) else f"{rate:.3f}")
+
+q1, q2 = st.columns(2)
+q1.metric("浆料产出强度(m³/吨)", "-" if np.isnan(slurry_rate) else f"{slurry_rate:.3f}")
+q2.metric("压缩箱累计(桶)", f"{compress_bucket:,.0f}")
 
 st.divider()
 st.subheader("出渣率（日）")
 
 valid_in = dfr["incoming_ton"].where(dfr["incoming_ton"] > 0)
 dfr["slag_rate"] = dfr["slag_total_ton"] / valid_in
+if "centrifuge_feed_m3" in dfr.columns:
+    dfr["slurry_per_ton"] = dfr["centrifuge_feed_m3"] / valid_in
 
 fig = px.line(dfr, x="date", y="slag_rate", title="出渣率（日）")
 st.plotly_chart(fig, use_container_width=True)
+
+if "slurry_per_ton" in dfr.columns:
+    st.subheader("浆料产出强度（日）")
+    fig = px.line(dfr, x="date", y="slurry_per_ton", title="浆料产出强度（日）")
+    st.plotly_chart(fig, use_container_width=True)
+
+if "compress_bucket_count" in dfr.columns and dfr["compress_bucket_count"].notna().sum() > 0:
+    st.subheader("压缩箱积压趋势")
+    fig = px.bar(dfr, x="date", y="compress_bucket_count", title="压缩箱（桶）")
+    st.plotly_chart(fig, use_container_width=True)
 
 st.subheader("出渣率分布")
 hist_df = dfr.dropna(subset=["slag_rate"]).copy()
@@ -145,11 +173,17 @@ threshold = st.number_input(
     max_value=2.0,
 )
 
+cols = ["date", "incoming_ton", "slag_total_ton", "slag_rate"]
+if "centrifuge_feed_m3" in dfr.columns:
+    cols.append("centrifuge_feed_m3")
+if "compress_bucket_count" in dfr.columns:
+    cols.append("compress_bucket_count")
+
 abn = (
     dfr.dropna(subset=["slag_rate"])
     .loc[
         lambda x: x["slag_rate"] > threshold,
-        ["date", "incoming_ton", "slag_total_ton", "slag_rate"],
+        cols,
     ]
     .sort_values("slag_rate", ascending=False)
 )

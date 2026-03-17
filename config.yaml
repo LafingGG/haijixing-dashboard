@@ -1,6 +1,8 @@
 thresholds:
-  slag_rate_high: 0.65
+  slag_rate_high: 0.75
   water_intensity_high: 0.5
   elec_intensity_high: 80.0
   water_m3_high: 999999.0
   daily_elec_kwh_high: 999999.0
+ops:
+  bucket_to_ton: 0.2

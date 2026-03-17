@@ -97,6 +97,7 @@ def ensure_snapshot_schema(db_path: str) -> None:
         if not exists:
             _create_fact_daily_ops_v2(conn)
             conn.execute("ALTER TABLE fact_daily_ops_v2 RENAME TO fact_daily_ops")
+            _ensure_fact_daily_ops_columns(conn, "fact_daily_ops")
             _ensure_settings(conn)
             conn.commit()
             return
@@ -104,6 +105,7 @@ def ensure_snapshot_schema(db_path: str) -> None:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(fact_daily_ops)").fetchall()]
         if "snapshot_id" in cols:
             # already v2
+            _ensure_fact_daily_ops_columns(conn, "fact_daily_ops")
             _ensure_settings(conn)
             conn.commit()
             return
@@ -120,6 +122,7 @@ def ensure_snapshot_schema(db_path: str) -> None:
         conn.execute("ALTER TABLE fact_daily_ops RENAME TO fact_daily_ops_old")
         conn.execute("ALTER TABLE fact_daily_ops_v2 RENAME TO fact_daily_ops")
         conn.execute("DROP TABLE fact_daily_ops_old")
+        _ensure_fact_daily_ops_columns(conn, "fact_daily_ops")
 
         _insert_snapshot(conn, legacy_snapshot, created_by="system", status="published", note="auto-migrated from v1")
         _set_setting(conn, "active_snapshot_id", legacy_snapshot)
@@ -193,6 +196,28 @@ def get_active_snapshot_id(db_path: str) -> str:
     finally:
         conn.close()
 
+
+
+
+FACT_DAILY_OPS_EXTRA_COLUMNS = {
+    "incoming_bucket_count": "REAL",
+    "line1_feed_bucket_count": "REAL",
+    "line1_slag_bucket_count": "REAL",
+    "line2_feed_bucket_count": "REAL",
+    "line2_slag_bucket_count": "REAL",
+    "compress_bucket_count": "REAL",
+    "centrifuge_meter_m3": "REAL",
+    "centrifuge_feed_m3": "REAL",
+    "line1_runtime_hours": "REAL",
+    "line2_runtime_hours": "REAL",
+}
+
+
+def _ensure_fact_daily_ops_columns(conn: sqlite3.Connection, table_name: str = "fact_daily_ops") -> None:
+    existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    for col, col_type in FACT_DAILY_OPS_EXTRA_COLUMNS.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {col} {col_type}")
 
 def get_staging_snapshot_id(db_path: str) -> Optional[str]:
     ensure_snapshot_schema(db_path)
@@ -602,6 +627,16 @@ def _create_fact_daily_ops_v2(conn: sqlite3.Connection) -> None:
             to_wwtp_m3 REAL,
             wwtp_flow_m3 REAL,
             arrive_wwtp_m3 REAL,
+            incoming_bucket_count REAL,
+            line1_feed_bucket_count REAL,
+            line1_slag_bucket_count REAL,
+            line2_feed_bucket_count REAL,
+            line2_slag_bucket_count REAL,
+            compress_bucket_count REAL,
+            centrifuge_meter_m3 REAL,
+            centrifuge_feed_m3 REAL,
+            line1_runtime_hours REAL,
+            line2_runtime_hours REAL,
             source_sheet TEXT,
             PRIMARY KEY(snapshot_id, date)
         );
