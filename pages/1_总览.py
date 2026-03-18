@@ -472,8 +472,8 @@ else:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# ========= 主视图 2：双线处理对比 =========
-st.subheader("双线处理对比")
+# ========= 主视图 2：双线处理 / 出渣对比 =========
+st.subheader("双线处理 / 出渣对比")
 
 has_line_compare = (
     "line1_feed_bucket_count" in dfr.columns
@@ -486,6 +486,7 @@ has_line_compare = (
 
 if has_line_compare:
     cols_needed = ["date", "line1_feed_bucket_count", "line2_feed_bucket_count"]
+
     if "line1_slag_bucket_count" in dfr.columns:
         cols_needed.append("line1_slag_bucket_count")
     if "line2_slag_bucket_count" in dfr.columns:
@@ -499,12 +500,14 @@ if has_line_compare:
     if "line2_slag_bucket_count" not in line_df.columns:
         line_df["line2_slag_bucket_count"] = np.nan
 
-    # 出渣率
+    # 出渣比例
     line_df["line1_slag_rate"] = (
-        line_df["line1_slag_bucket_count"] / line_df["line1_feed_bucket_count"]
+        pd.to_numeric(line_df["line1_slag_bucket_count"], errors="coerce")
+        / pd.to_numeric(line_df["line1_feed_bucket_count"], errors="coerce")
     )
     line_df["line2_slag_rate"] = (
-        line_df["line2_slag_bucket_count"] / line_df["line2_feed_bucket_count"]
+        pd.to_numeric(line_df["line2_slag_bucket_count"], errors="coerce")
+        / pd.to_numeric(line_df["line2_feed_bucket_count"], errors="coerce")
     )
 
     fig = go.Figure()
@@ -521,7 +524,7 @@ if has_line_compare:
         name="2线打料桶数",
     )
 
-    # 折线：出渣率
+    # 折线：出渣比例
     fig.add_scatter(
         x=line_df["日期"],
         y=line_df["line1_slag_rate"],
@@ -540,7 +543,7 @@ if has_line_compare:
     fig.update_layout(
         barmode="group",
         xaxis=dict(title="日期"),
-        yaxis=dict(title="桶数"),
+        yaxis=dict(title="处理桶数"),
         yaxis2=dict(
             title="出渣比例",
             overlaying="y",
@@ -548,21 +551,49 @@ if has_line_compare:
             tickformat=".0%",
             range=[0, 1],
         ),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        ),
     )
 
-    st.plotly_chart(polish_fig(fig, "当前筛选区间双线处理桶数 / 出渣比例"), use_container_width=True)
+    st.plotly_chart(
+        polish_fig(fig, "当前筛选区间双线处理桶数 / 出渣比例"),
+        use_container_width=True
+    )
 
-    a1, a2, a3, a4 = st.columns(4)
-    line1_bucket = summary["line1_feed_bucket_count"]
-    line2_bucket = summary["line2_feed_bucket_count"]
+        # 汇总指标（两排，每排4个）
+    line1_bucket = _sum_col(dfr, "line1_feed_bucket_count")
+    line2_bucket = _sum_col(dfr, "line2_feed_bucket_count")
     line1_slag_bucket = _sum_col(dfr, "line1_slag_bucket_count")
     line2_slag_bucket = _sum_col(dfr, "line2_slag_bucket_count")
 
-    a1.metric("1线累计", f"{line1_bucket:,.0f} 桶")
-    a2.metric("2线累计", f"{line2_bucket:,.0f} 桶")
-    a3.metric("1线出渣", f"{line1_slag_bucket:,.0f} 桶" if line1_slag_bucket > 0 else "-")
-    a4.metric("2线出渣", f"{line2_slag_bucket:,.0f} 桶" if line2_slag_bucket > 0 else "-")
+    line1_runtime_hours = _sum_col(dfr, "line1_runtime_hours")
+    line2_runtime_hours = _sum_col(dfr, "line2_runtime_hours")
+
+    line1_feed_ton = line1_bucket * BUCKET_TO_TON
+    line2_feed_ton = line2_bucket * BUCKET_TO_TON
+    line1_slag_ton = line1_slag_bucket * BUCKET_TO_TON
+    line2_slag_ton = line2_slag_bucket * BUCKET_TO_TON
+
+    line1_tph = safe_div(line1_feed_ton, line1_runtime_hours)
+    line2_tph = safe_div(line2_feed_ton, line2_runtime_hours)
+
+    r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+    r1c1.metric("1线累计", f"{line1_feed_ton:,.1f} 吨" if line1_feed_ton > 0 else "-")
+    r1c2.metric("1线出渣", f"{line1_slag_ton:,.1f} 吨" if line1_slag_ton > 0 else "-")
+    r1c3.metric("1线开机时长", f"{line1_runtime_hours:,.1f} h" if line1_runtime_hours > 0 else "-")
+    r1c4.metric("1线吨/小时", f"{line1_tph:,.2f}" if not pd.isna(line1_tph) else "-")
+
+    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+    r2c1.metric("2线累计", f"{line2_feed_ton:,.1f} 吨" if line2_feed_ton > 0 else "-")
+    r2c2.metric("2线出渣", f"{line2_slag_ton:,.1f} 吨" if line2_slag_ton > 0 else "-")
+    r2c3.metric("2线开机时长", f"{line2_runtime_hours:,.1f} h" if line2_runtime_hours > 0 else "-")
+    r2c4.metric("2线吨/小时", f"{line2_tph:,.2f}" if not pd.isna(line2_tph) else "-")
+
 else:
     st.info("当前区间暂无可展示的双线处理数据。")
 

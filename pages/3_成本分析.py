@@ -1,16 +1,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os
-import tempfile
-
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-st.set_page_config(page_title="成本分析", page_icon="💰", layout="wide")
+st.set_page_config(page_title="成本驾驶舱", page_icon="💰", layout="wide")
 
-from etl.parse_purchase_excel import parse_purchase_workbook
 from utils.bootstrap import bootstrap_page
 from utils.cost_analytics import (
     attach_monthly_ton_cost,
@@ -18,7 +14,7 @@ from utils.cost_analytics import (
     build_monthly_cost_summary,
     load_cost_detail_data,
 )
-from utils.cost_store import ensure_cost_schema, replace_purchase_cost_batch
+from utils.cost_store import ensure_cost_schema, get_latest_cost_import_info
 from utils.data_access import load_daily_ops_data
 from utils.ops_analysis import build_monthly_ops_summary, prepare_ops_metrics
 from utils.paths import get_db_path
@@ -26,16 +22,21 @@ from utils.sidebar_filters import render_global_sidebar_by_df
 from utils.snapshot import get_active_snapshot_id
 
 
+# ============================================================
+# 基础设置
+# ============================================================
+DB_PATH = get_db_path()
+user = bootstrap_page(DB_PATH)
+ensure_cost_schema(DB_PATH)
+
+
 def polish_fig(fig):
     fig.update_layout(
         hovermode="x unified",
-        margin=dict(l=10, r=10, t=20, b=10),
+        margin=dict(l=10, r=10, t=40, b=10),
         legend_title_text="",
     )
-    fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.06)")
-    fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.06)")
     return fig
-
 
 def find_first_existing_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     for c in candidates:
@@ -50,23 +51,30 @@ def safe_div(a, b):
     return a / b
 
 
-def normalize_text_series(s: pd.Series) -> pd.Series:
-    return s.fillna("未分类").astype(str).str.strip().replace({"": "未分类"})
-
-
 def build_focus_category_kpis(view_detail_df: pd.DataFrame, period_ton: float) -> dict[str, float]:
-    if view_detail_df.empty:
+    if view_detail_df is None or view_detail_df.empty:
         return {}
 
     work = view_detail_df.copy()
     code_col = find_first_existing_col(work, ["category_code"])
 
-    if code_col is None or "amount" not in work.columns:
+    # 没有 category_code 就无法精确按预设分类编码统计
+    if code_col is None:
         return {}
 
-    grouped = work.groupby(code_col, as_index=True)["amount"].sum()
+    amount_col = None
+    for c in ["allocated_amount", "amount"]:
+        if c in work.columns:
+            amount_col = c
+            break
 
-    # 对齐 utils.cost_store.CATEGORY_SEED
+    if amount_col is None:
+        return {}
+
+    work[amount_col] = pd.to_numeric(work[amount_col], errors="coerce").fillna(0.0)
+
+    grouped = work.groupby(code_col, as_index=True)[amount_col].sum()
+
     focus_code_map = {
         "固渣费吨成本": "slag",
         "碳源费吨成本": "carbon_source",
@@ -80,334 +88,232 @@ def build_focus_category_kpis(view_detail_df: pd.DataFrame, period_ton: float) -
         out[label] = safe_div(amt, period_ton)
     return out
 
-db_path = get_db_path()
-user = bootstrap_page(db_path)
 
-st.title("💰 成本分析")
-st.caption("基于采购付款明细，按当前筛选区间分析成本结构、月度趋势与吨均成本。")
+@st.cache_data(ttl=60)
+def load_latest_cost_import_cached(db_path: str):
+    return get_latest_cost_import_info(db_path)
 
-snapshot_id = get_active_snapshot_id(db_path)
-is_admin = getattr(user, "role", "") == "admin"
+
+@st.cache_data(ttl=60)
+def load_cost_data_cached(db_path: str) -> pd.DataFrame:
+    df = load_cost_detail_data(db_path)
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+
+    if "pay_date" in out.columns:
+        out["pay_date"] = pd.to_datetime(out["pay_date"], errors="coerce")
+
+    if "biz_date_start" in out.columns:
+        out["biz_date_start"] = pd.to_datetime(out["biz_date_start"], errors="coerce")
+
+    if "biz_date_end" in out.columns:
+        out["biz_date_end"] = pd.to_datetime(out["biz_date_end"], errors="coerce")
+
+    for c in ["amount", "allocated_amount"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+
+    for c in [
+        "analysis_month",
+        "category_level1",
+        "category_name",
+        "item_name",
+        "vendor_name",
+        "remark",
+    ]:
+        if c in out.columns:
+            out[c] = out[c].fillna("").astype(str)
+
+    return out
+
+
+@st.cache_data(ttl=60)
+def load_ops_data_cached(db_path: str, snapshot_id: str) -> pd.DataFrame:
+    df = load_daily_ops_data(db_path, snapshot_id=snapshot_id)
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    if "date" in out.columns:
+        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    return out
+
 
 # ============================================================
-# 管理员上传区
+# 页面标题
 # ============================================================
-if is_admin:
-    with st.expander("🛠 管理后台：采购费用 Excel 导入", expanded=False):
-        st.caption("支持 sheet：费用明细表 / 费用明细 / 项目垃圾处理费用。导入后将直接替换当前成本数据。")
+st.title("💰 成本驾驶舱")
 
-        up = st.file_uploader(
-            "上传采购费用 Excel",
-            type=["xlsx", "xls"],
-            key="cost_uploader",
+latest_cost_import = load_latest_cost_import_cached(DB_PATH)
+active_snapshot_id = get_active_snapshot_id(DB_PATH)
+
+c1, c2 = st.columns([1.8, 2.2])
+
+with c1:
+    st.info(f"当前运营发布快照：`{active_snapshot_id}`")
+
+with c2:
+    if latest_cost_import:
+        st.success(
+            "当前成本版本："
+            f"{latest_cost_import.get('imported_at', '-')}"
+            f" ｜ 导入人：{latest_cost_import.get('imported_by', '-')}"
+            f" ｜ 文件：{latest_cost_import.get('source_file', '-')}"
+            f" ｜ 行数：{latest_cost_import.get('rows_written', '-')}"
         )
-
-        if up is not None:
-            with st.spinner("解析采购费用 Excel..."):
-                suffix = os.path.splitext(up.name)[1] or ".xlsx"
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-                tmp.write(up.getbuffer())
-                tmp.close()
-
-                try:
-                    preview_df = parse_purchase_workbook(tmp.name)
-                finally:
-                    try:
-                        os.unlink(tmp.name)
-                    except Exception:
-                        pass
-
-            if preview_df.empty:
-                st.error("未解析到采购费用数据，请检查 sheet 名、表头字段或表格结构。")
-            else:
-                c1, c2 = st.columns([1.1, 1.9])
-
-                with c1:
-                    st.markdown("#### 导入检查")
-                    st.write(
-                        {
-                            "rows": int(len(preview_df)),
-                            "date_min": preview_df["expense_date"].min() if "expense_date" in preview_df.columns else None,
-                            "date_max": preview_df["expense_date"].max() if "expense_date" in preview_df.columns else None,
-                            "months": sorted(preview_df["analysis_month"].dropna().astype(str).unique().tolist())[:12]
-                            if "analysis_month" in preview_df.columns
-                            else [],
-                        }
-                    )
-
-                    if "category_name" in preview_df.columns:
-                        cat_preview = (
-                            preview_df["category_name"]
-                            .pipe(normalize_text_series)
-                            .value_counts(dropna=False)
-                            .rename_axis("分类")
-                            .reset_index(name="条数")
-                        )
-                        st.markdown("#### 分类预览")
-                        st.dataframe(cat_preview, use_container_width=True, hide_index=True)
-
-                with c2:
-                    st.markdown("#### 数据预览（前 20 行）")
-                    show_cols = [
-                        c
-                        for c in [
-                            "expense_date",
-                            "analysis_month",
-                            "item_name",
-                            "payee",
-                            "amount",
-                            "category_name",
-                            "category_code",
-                            "level1_name",
-                            "remark",
-                            "date_source",
-                        ]
-                        if c in preview_df.columns
-                    ]
-                    st.dataframe(preview_df[show_cols].head(20), use_container_width=True, hide_index=True)
-
-                if st.button("导入并替换当前成本数据", type="primary", key="btn_import_cost"):
-                    try:
-                        ensure_cost_schema(db_path)
-
-                        suffix = os.path.splitext(up.name)[1] or ".xlsx"
-                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-                        tmp.write(up.getbuffer())
-                        tmp.close()
-
-                        try:
-                            df_import = parse_purchase_workbook(tmp.name)
-                            info = replace_purchase_cost_batch(
-                                db_path=db_path,
-                                df=df_import,
-                                imported_by=getattr(user, "username", "admin"),
-                                source_file=up.name,
-                            )
-                        finally:
-                            try:
-                                os.unlink(tmp.name)
-                            except Exception:
-                                pass
-
-                        st.success(
-                            f"导入成功：写入 {info.get('rows_written', 0)} 行，batch_id = {info.get('batch_id', '-')}"
-                        )
-                        st.cache_data.clear()
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"导入失败：{e}")
-else:
-    st.caption("你当前为查看者账号：仅可查看已导入的成本数据。")
-
-# ============================================================
-# 读取成本 + 运行数据
-# ============================================================
-detail_df = load_cost_detail_data(db_path, snapshot_id=snapshot_id)
-ops_df = prepare_ops_metrics(load_daily_ops_data(db_path, snapshot_id=snapshot_id))
-ops_monthly_df = build_monthly_ops_summary(ops_df)
-
-if detail_df.empty:
-    st.warning("当前暂无成本明细数据。管理员可在本页上方上传采购费用 Excel。")
-    st.stop()
-
-# 优先按成本归属月份（analysis_month）筛选；若没有，再退回付款日期等字段
-detail_df = detail_df.copy()
-
-if "analysis_month" in detail_df.columns:
-    detail_df["analysis_month"] = (
-        detail_df["analysis_month"]
-        .astype(str)
-        .str.strip()
-        .replace({"": None, "None": None, "nan": None})
-    )
-
-    # 保留原 analysis_month（YYYY-MM）给后续月度汇总使用
-    # 单独生成一个筛选辅助日期列
-    detail_df["_filter_date"] = pd.to_datetime(
-        detail_df["analysis_month"] + "-01",
-        errors="coerce",
-    )
-
-    detail_df = detail_df[detail_df["_filter_date"].notna()].copy()
-
-    if detail_df.empty:
-        st.warning("成本明细存在记录，但 analysis_month 无法解析。请检查导入数据。")
-        st.stop()
-
-    date_col = "_filter_date"
-
-else:
-    date_col = find_first_existing_col(
-        detail_df,
-        ["expense_date", "pay_date", "biz_date_start", "biz_date_end"],
-    )
-
-    if date_col is None:
-        st.warning("成本明细中缺少可用于时间筛选的日期字段（analysis_month / expense_date / pay_date / biz_date_start / biz_date_end）。")
-        st.stop()
-
-    detail_df[date_col] = pd.to_datetime(detail_df[date_col], errors="coerce")
-    detail_df = detail_df[detail_df[date_col].notna()].copy()
-
-    if detail_df.empty:
-        st.warning("成本明细存在记录，但日期字段无法解析。请检查导入数据。")
-        st.stop()
-
-
-# ============================================================
-# 固定趋势数据：始终取完整成本数据里的最近 6 个月
-# 不受侧边栏当前时间范围影响
-# ============================================================
-trend_monthly_cat_df = build_monthly_cost_summary(detail_df)
-trend_month_total_df = build_month_total_cost(trend_monthly_cat_df)
-trend_month_total_df = attach_monthly_ton_cost(trend_month_total_df, ops_monthly_df)
-
-if not trend_month_total_df.empty and "analysis_month" in trend_month_total_df.columns:
-    trend_month_total_df = trend_month_total_df.copy()
-    trend_month_total_df["analysis_month"] = trend_month_total_df["analysis_month"].astype(str)
-    trend_month_total_df = trend_month_total_df.sort_values("analysis_month").tail(6).copy()
-
-    recent_6_months = trend_month_total_df["analysis_month"].tolist()
-
-    if not trend_monthly_cat_df.empty and "analysis_month" in trend_monthly_cat_df.columns:
-        trend_monthly_cat_df = trend_monthly_cat_df.copy()
-        trend_monthly_cat_df["analysis_month"] = trend_monthly_cat_df["analysis_month"].astype(str)
-        trend_monthly_cat_df = trend_monthly_cat_df[
-            trend_monthly_cat_df["analysis_month"].isin(recent_6_months)
-        ].copy()
-else:
-    trend_month_total_df = pd.DataFrame()
-    trend_monthly_cat_df = pd.DataFrame()
-
-start_date, end_date, date_meta = render_global_sidebar_by_df(
-    detail_df.rename(columns={date_col: "date"}),
-    date_col="date",
-)
-
-view_detail_df = detail_df[
-    (detail_df[date_col].dt.date >= start_date) & (detail_df[date_col].dt.date <= end_date)
-].copy()
-
-if view_detail_df.empty:
-    st.warning("当前筛选区间内无成本明细，请调整侧边栏时间范围。")
-    st.stop()
-
-if "analysis_month" in view_detail_df.columns and not view_detail_df.empty:
-    selected_months = sorted(
-        {
-            str(x).strip()
-            for x in view_detail_df["analysis_month"].dropna().astype(str).tolist()
-            if str(x).strip()
-        }
-    )
-    if selected_months:
-        st.caption(f"当前成本归属月份：{' ~ '.join([selected_months[0], selected_months[-1]])}")
     else:
-        st.caption(f"当前筛选区间：{date_meta['label']}")
-else:
-    st.caption(f"当前筛选区间：{date_meta['label']}")
+        st.warning("当前还没有成本导入记录，请先到首页 app.py 里导入成本 Excel。")
+
+st.caption("说明：成本 Excel 上传入口已统一迁移到首页 `app.py`，本页仅负责分析展示。")
+
 
 # ============================================================
-# 基于筛选区间重建汇总
+# 读取数据
 # ============================================================
-monthly_cat_df = build_monthly_cost_summary(view_detail_df)
-month_total_df = build_month_total_cost(monthly_cat_df)
-month_total_df = attach_monthly_ton_cost(month_total_df, ops_monthly_df)
+cost_df = load_cost_data_cached(DB_PATH)
+ops_df = load_ops_data_cached(DB_PATH, active_snapshot_id)
 
-if month_total_df.empty:
-    st.warning("当前筛选区间已读取到成本明细，但未能生成月度汇总。请检查 analysis_month 或金额字段。")
+if cost_df.empty:
+    st.warning("当前没有成本数据，请先到首页导入成本 Excel。")
     st.stop()
 
+if ops_df.empty:
+    st.warning("当前没有已发布运营数据，吨成本相关指标将无法正确计算。")
+
+
 # ============================================================
-# 当前区间分类汇总：按 category_name / category_code 统计细分类
+# 成本预处理
 # ============================================================
-category_name_col = find_first_existing_col(view_detail_df, ["category_name"])
-category_code_col = find_first_existing_col(view_detail_df, ["category_code"])
+monthly_cost_df = build_monthly_cost_summary(cost_df)
+month_total_cost_df = build_month_total_cost(monthly_cost_df)
 
-if category_name_col is None:
-    st.warning("当前成本数据缺少分类字段（category_name）。")
-    st.stop()
+ops_metrics = prepare_ops_metrics(ops_df) if not ops_df.empty else pd.DataFrame()
+monthly_ops_df = build_monthly_ops_summary(ops_metrics) if not ops_metrics.empty else pd.DataFrame()
 
-group_cols = [category_name_col]
-if category_code_col is not None:
-    group_cols = [category_code_col, category_name_col]
-
-cur_cat = (
-    view_detail_df.groupby(group_cols, as_index=False)["amount"]
-    .sum()
-    .sort_values("amount", ascending=False)
-    .copy()
+month_cost_with_ton_df = (
+    attach_monthly_ton_cost(month_total_cost_df, monthly_ops_df)
+    if not month_total_cost_df.empty and not monthly_ops_df.empty
+    else month_total_cost_df.copy()
 )
 
-if category_name_col != "category_name":
-    cur_cat = cur_cat.rename(columns={category_name_col: "category_name"})
-if category_code_col and category_code_col != "category_code" and category_code_col in cur_cat.columns:
-    cur_cat = cur_cat.rename(columns={category_code_col: "category_code"})
+for df_ in [cost_df, monthly_cost_df, month_total_cost_df, monthly_ops_df, month_cost_with_ton_df]:
+    if df_ is not None and not df_.empty and "analysis_month" in df_.columns:
+        df_["analysis_month"] = df_["analysis_month"].astype(str)
 
-cur_cat["category_name"] = normalize_text_series(cur_cat["category_name"])
-total_amount = float(cur_cat["amount"].sum()) if not cur_cat.empty else 0.0
-cur_cat["amount_share"] = cur_cat["amount"] / total_amount if total_amount else 0.0
 
 # ============================================================
-# 处理量口径修复：
-# 成本页按 analysis_month 做归属时，处理量也按对应月份汇总
+# 侧边栏筛选
 # ============================================================
-period_cost = float(month_total_df["amount"].sum()) if not month_total_df.empty else 0.0
+filter_base_df = cost_df.copy()
+use_date_col = None
 
-period_ton = 0.0
-
-# 优先按当前筛选结果里的 analysis_month 去汇总运营处理量
-if (
-    "analysis_month" in view_detail_df.columns
-    and not view_detail_df.empty
-    and not ops_monthly_df.empty
-    and "month" in ops_monthly_df.columns
-    and "incoming_ton" in ops_monthly_df.columns
-):
-    selected_months = sorted(
-        {
-            str(x).strip()
-            for x in view_detail_df["analysis_month"].dropna().astype(str).tolist()
-            if str(x).strip()
-        }
+if "pay_date" in filter_base_df.columns and filter_base_df["pay_date"].notna().any():
+    use_date_col = "pay_date"
+elif "biz_date_start" in filter_base_df.columns and filter_base_df["biz_date_start"].notna().any():
+    use_date_col = "biz_date_start"
+elif "analysis_month" in filter_base_df.columns:
+    filter_base_df = filter_base_df.copy()
+    filter_base_df["__month_date"] = pd.to_datetime(
+        filter_base_df["analysis_month"] + "-01",
+        errors="coerce"
     )
+    use_date_col = "__month_date"
 
-    ops_monthly_view = ops_monthly_df.copy()
-    ops_monthly_view["month"] = ops_monthly_view["month"].astype(str).str.strip()
+if use_date_col is None:
+    st.warning("缺少可筛选的成本时间字段。")
+    st.stop()
 
-    ops_monthly_view = ops_monthly_view[
-        ops_monthly_view["month"].isin(selected_months)
-    ].copy()
+start_date, end_date, sidebar_meta = render_global_sidebar_by_df(
+    filter_base_df,
+    date_col=use_date_col,
+    title="成本分析筛选",
+    show_data_hint=True,
+)
 
-    period_ton = float(ops_monthly_view["incoming_ton"].sum(skipna=True)) if not ops_monthly_view.empty else 0.0
 
-# 兜底：如果没有 analysis_month，再按日期区间从运营日报统计
-elif not ops_df.empty and "date" in ops_df.columns and "incoming_ton" in ops_df.columns:
-    ops_df = ops_df.copy()
-    ops_df["date"] = pd.to_datetime(ops_df["date"], errors="coerce")
-    ops_view_df = ops_df[
-        (ops_df["date"].dt.date >= start_date) &
-        (ops_df["date"].dt.date <= end_date)
-    ].copy()
-    period_ton = float(ops_view_df["incoming_ton"].sum(skipna=True)) if not ops_view_df.empty else 0.0
+def filter_cost_detail(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
 
-period_cost_per_ton = safe_div(period_cost, period_ton)
-period_count = len(view_detail_df)
+    start_month = pd.Timestamp(start_date).to_period("M").strftime("%Y-%m")
+    end_month = pd.Timestamp(end_date).to_period("M").strftime("%Y-%m")
+
+    if "analysis_month" in out.columns:
+        out = out[
+            (out["analysis_month"] >= start_month) &
+            (out["analysis_month"] <= end_month)
+        ]
+
+    return out
+
+
+def filter_month_df(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    start_month = pd.Timestamp(start_date).to_period("M").strftime("%Y-%m")
+    end_month = pd.Timestamp(end_date).to_period("M").strftime("%Y-%m")
+
+    if "analysis_month" in out.columns:
+        out = out[
+            (out["analysis_month"] >= start_month) &
+            (out["analysis_month"] <= end_month)
+        ]
+
+    return out
+
+
+cost_df_view = filter_cost_detail(cost_df)
+monthly_cost_df_view = filter_month_df(monthly_cost_df)
+month_total_cost_df_view = filter_month_df(month_total_cost_df)
+month_cost_with_ton_df_view = filter_month_df(month_cost_with_ton_df)
+
 
 # ============================================================
-# KPI
+# 顶部指标
 # ============================================================
+
+total_cost = (
+    float(cost_df_view["allocated_amount"].sum())
+    if not cost_df_view.empty and "allocated_amount" in cost_df_view.columns
+    else float(cost_df_view["amount"].sum()) if not cost_df_view.empty and "amount" in cost_df_view.columns
+    else 0.0
+)
+
+current_period_total = (
+    float(month_total_cost_df_view["amount"].sum())
+    if not month_total_cost_df_view.empty and "amount" in month_total_cost_df_view.columns
+    else total_cost
+)
+
+incoming_ton = None
+cost_per_ton = None
+
+if not month_cost_with_ton_df_view.empty:
+    if "incoming_ton" in month_cost_with_ton_df_view.columns:
+        incoming_ton = pd.to_numeric(
+            month_cost_with_ton_df_view["incoming_ton"], errors="coerce"
+        ).fillna(0).sum()
+
+    if "cost_per_ton" in month_cost_with_ton_df_view.columns:
+        cps = pd.to_numeric(
+            month_cost_with_ton_df_view["cost_per_ton"], errors="coerce"
+        ).dropna()
+        cost_per_ton = cps.mean() if not cps.empty else None
+
+# 当前区间处理量与吨成本
+period_ton = incoming_ton if incoming_ton is not None else 0.0
+period_cost_per_ton = cost_per_ton
+
+st.markdown("## 一、核心指标")
+
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("当前区间运营费用", f"{period_cost:,.0f}")
-m2.metric("当前区间处理量（吨）", f"{period_ton:,.1f}")
-m3.metric("当前区间吨均成本", f"{period_cost_per_ton:,.2f}" if pd.notna(period_cost_per_ton) else "-")
-m4.metric("费用笔数", period_count)
+m1.metric("费用总额（元）", f"{total_cost:,.0f}")
+m2.metric("区间汇总成本（元）", f"{current_period_total:,.0f}")
+m3.metric("区间进料量（吨）", f"{period_ton:,.1f}" if period_ton is not None else "-")
+m4.metric("吨成本（元/吨）", f"{period_cost_per_ton:,.2f}" if period_cost_per_ton is not None and pd.notna(period_cost_per_ton) else "-")
 
-# ============================================================
-# 重点分类吨成本
-# ============================================================
-focus_kpis = build_focus_category_kpis(view_detail_df, period_ton)
-st.markdown("### 重点分类吨成本")
+focus_kpis = build_focus_category_kpis(cost_df_view, period_ton)
 
 f1, f2, f3, f4 = st.columns(4)
 
@@ -439,169 +345,133 @@ f4.metric(
     else "-"
 )
 
-# ============================================================
-# 分类结构
-# ============================================================
-st.markdown("### 分类结构")
-c1, c2 = st.columns([1.1, 1.2])
 
-with c1:
-    if not cur_cat.empty:
-        fig = px.pie(
-            cur_cat,
-            names="category_name",
-            values="amount",
+# ============================================================
+# 成本结构分析
+# ============================================================
+st.markdown("## 二、成本结构分析")
+
+if monthly_cost_df_view.empty:
+    st.info("当前筛选条件下暂无成本结构数据。")
+else:
+    view = monthly_cost_df_view.copy()
+
+    group_col = "category_level1" if "category_level1" in view.columns else None
+    value_col = "amount" if "amount" in view.columns else None
+
+    if group_col is None or value_col is None:
+        st.warning("成本结构数据缺少必要字段。")
+    else:
+        pie_df = (
+            view.groupby(group_col, as_index=False)[value_col]
+            .sum()
+            .sort_values(value_col, ascending=False)
         )
-        st.plotly_chart(polish_fig(fig), use_container_width=True)
-    else:
-        st.info("当前区间无分类数据。")
 
-with c2:
-    if not cur_cat.empty:
-        show_df = cur_cat.copy()
-        show_df["amount_share"] = show_df["amount_share"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "-")
-        rename_map = {
-            "category_name": "分类",
-            "amount": "金额",
-            "amount_share": "占比",
-        }
-        if "category_code" in show_df.columns:
-            rename_map["category_code"] = "分类编码"
-        show_df = show_df.rename(columns=rename_map)
-        cols = [c for c in ["分类编码", "分类", "金额", "占比"] if c in show_df.columns]
-        st.dataframe(show_df[cols], use_container_width=True, hide_index=True)
-    else:
-        st.info("暂无分类明细。")
+        c1, c2 = st.columns([1.2, 1.8])
 
-# ============================================================
-# 成本结构条形图
-# ============================================================
-st.markdown("### 成本结构排序")
-if not cur_cat.empty:
-    bar_df = cur_cat.sort_values("amount", ascending=True).copy()
-    fig = px.bar(bar_df, x="amount", y="category_name", orientation="h")
-    fig.update_layout(xaxis_title="金额", yaxis_title="")
-    st.plotly_chart(polish_fig(fig), use_container_width=True)
+        with c1:
+            fig = px.pie(
+                pie_df,
+                names=group_col,
+                values=value_col,
+                title="一级分类成本占比",
+            )
+            st.plotly_chart(polish_fig(fig), use_container_width=True)
+
+        with c2:
+            fig2 = px.bar(
+                pie_df,
+                x=group_col,
+                y=value_col,
+                title="一级分类成本对比",
+                text_auto=".0f",
+            )
+            st.plotly_chart(polish_fig(fig2), use_container_width=True)
+
+        st.dataframe(pie_df, use_container_width=True)
 
 # ============================================================
-# 月度趋势（固定最近 6 个月）
+# 月度趋势
 # ============================================================
-st.markdown("### 月度趋势（最近 6 个月）")
-t1, t2 = st.columns(2)
+st.markdown("## 三、月度趋势")
 
-with t1:
-    if not trend_month_total_df.empty:
-        st.markdown("**月度运营费用**")
-        fig = px.bar(trend_month_total_df, x="month_label", y="amount")
-        fig.update_layout(xaxis_title="", yaxis_title="金额")
-        st.plotly_chart(polish_fig(fig), use_container_width=True)
+if month_cost_with_ton_df.empty:
+    st.info("暂无月度趋势数据。")
+else:
+    trend_df = month_cost_with_ton_df.copy()
 
-with t2:
-    if not trend_month_total_df.empty:
-        st.markdown("**吨均运营成本趋势**")
-        fig = px.line(trend_month_total_df, x="month_label", y="cost_per_ton", markers=True)
-        fig.update_layout(xaxis_title="", yaxis_title="元/吨")
-        st.plotly_chart(polish_fig(fig), use_container_width=True)
+    trend_cols = ["analysis_month"]
+    if "amount" in trend_df.columns:
+        trend_cols.append("amount")
+    if "incoming_ton" in trend_df.columns:
+        trend_cols.append("incoming_ton")
+    if "cost_per_ton" in trend_df.columns:
+        trend_cols.append("cost_per_ton")
 
-# ============================================================
-# 分类月度趋势（固定最近 6 个月）
-# ============================================================
-st.markdown("### 分类月度趋势（最近 6 个月）")
-if not trend_monthly_cat_df.empty:
-    trend_month_cat_show = trend_monthly_cat_df.copy()
+    trend_df = trend_df[trend_cols].drop_duplicates().sort_values("analysis_month")
 
-    trend_cat_name_col = find_first_existing_col(trend_month_cat_show, ["category_name"])
-    if trend_cat_name_col is None:
-        trend_cat_name_col = find_first_existing_col(trend_month_cat_show, ["category_level1", "level1_name"])
-
-    if trend_cat_name_col is not None:
-        if trend_cat_name_col != "category_name":
-            trend_month_cat_show = trend_month_cat_show.rename(columns={trend_cat_name_col: "category_name"})
-        trend_month_cat_show["category_name"] = normalize_text_series(trend_month_cat_show["category_name"])
-
-        fig = px.line(
-            trend_month_cat_show,
-            x="month_label",
+    if "amount" in trend_df.columns:
+        fig = px.bar(
+            trend_df,
+            x="analysis_month",
             y="amount",
-            color="category_name",
-            markers=True,
+            title="月度总成本趋势",
+            text_auto=".0f",
         )
-        fig.update_layout(xaxis_title="", yaxis_title="金额")
         st.plotly_chart(polish_fig(fig), use_container_width=True)
 
-# ============================================================
-# 成本异常提示
-# ============================================================
-st.markdown("### 成本异常提示")
-a1, a2 = st.columns(2)
-
-with a1:
-    if not cur_cat.empty:
-        top_cat = cur_cat.sort_values("amount", ascending=False).iloc[0]
-        st.info(f"当前区间最大成本分类：**{top_cat['category_name']}**，金额 **{top_cat['amount']:,.0f}** 元。")
-    else:
-        st.info("暂无分类数据。")
-
-with a2:
-    if not view_detail_df.empty and "amount" in view_detail_df.columns:
-        max_row = view_detail_df.sort_values("amount", ascending=False).iloc[0]
-        item_name = max_row["item_name"] if "item_name" in max_row.index else "-"
-        st.info(f"当前区间最大单笔支出：**{item_name}**，金额 **{float(max_row['amount']):,.0f}** 元。")
-    else:
-        st.info("暂无明细数据。")
+    if "cost_per_ton" in trend_df.columns:
+        fig2 = px.line(
+            trend_df,
+            x="analysis_month",
+            y="cost_per_ton",
+            markers=True,
+            title="月度吨成本趋势",
+        )
+        st.plotly_chart(polish_fig(fig2), use_container_width=True)
 
 # ============================================================
-# 当前区间原始明细
+# 分类汇总明细
 # ============================================================
-st.markdown("### 当前区间原始付款明细")
+st.markdown("## 四、分类汇总明细")
 
-vendor_col = find_first_existing_col(view_detail_df, ["vendor_name", "payee"])
-level1_col = find_first_existing_col(view_detail_df, ["category_level1", "level1_name"])
-category_code_col = find_first_existing_col(view_detail_df, ["category_code"])
-category_name_col = find_first_existing_col(view_detail_df, ["category_name"])
-allocated_col = find_first_existing_col(view_detail_df, ["allocated_amount"])
-remark_col = find_first_existing_col(view_detail_df, ["remark"])
+if monthly_cost_df_view.empty or "amount" not in monthly_cost_df_view.columns:
+    st.info("当前筛选条件下暂无分类汇总明细。")
+else:
+    summary_cols = [c for c in ["analysis_month", "category_level1"] if c in monthly_cost_df_view.columns]
+    summary_df = monthly_cost_df_view[summary_cols + ["amount"]].sort_values(summary_cols)
+    st.dataframe(summary_df, use_container_width=True)
 
-show_cols = [
-    c
-    for c in [
-        "expense_date",
-        "pay_date",
-        "biz_date_start",
-        "biz_date_end",
-        "analysis_month",
-        "item_name",
-        vendor_col,
-        category_code_col,
-        category_name_col,
-        level1_col,
-        "amount",
-        allocated_col,
-        remark_col,
-    ]
-    if c and c in view_detail_df.columns
+
+# ============================================================
+# 原始明细
+# ============================================================
+st.markdown("## 五、原始成本明细")
+
+show_cols_priority = [
+    "analysis_month",
+    "pay_date",
+    "biz_date_start",
+    "biz_date_end",
+    "category_level1",
+    "category_name",
+    "item_name",
+    "vendor_name",
+    "amount",
+    "allocated_amount",
+    "remark",
 ]
 
-sort_cols = [c for c in [date_col, "biz_date_start"] if c in view_detail_df.columns]
-if sort_cols:
-    view_detail_df = view_detail_df.sort_values(sort_cols, ascending=False)
+show_cols = [c for c in show_cols_priority if c in cost_df_view.columns]
+remaining_cols = [c for c in cost_df_view.columns if c not in show_cols]
+final_cols = show_cols + remaining_cols
 
-if show_cols:
-    rename_map = {}
-    if vendor_col:
-        rename_map[vendor_col] = "收款方"
-    if category_code_col:
-        rename_map[category_code_col] = "分类编码"
-    if category_name_col:
-        rename_map[category_name_col] = "分类名称"
-    if level1_col:
-        rename_map[level1_col] = "一级分类"
-    if allocated_col:
-        rename_map[allocated_col] = "分摊金额"
-    if remark_col:
-        rename_map[remark_col] = "备注"
-
-    display_df = view_detail_df[show_cols].rename(columns=rename_map)
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+if cost_df_view.empty:
+    st.info("当前筛选条件下暂无原始成本明细。")
 else:
-    st.info("当前区间无原始付款明细。")
+    sort_col = "pay_date" if "pay_date" in cost_df_view.columns else "analysis_month"
+    st.dataframe(
+        cost_df_view[final_cols].sort_values(by=sort_col, ascending=False),
+        use_container_width=True,
+    )
