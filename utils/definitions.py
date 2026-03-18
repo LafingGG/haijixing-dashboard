@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-DEFINITIONS_VERSION = "v1"
+DEFINITIONS_VERSION = "v2.1"
 
 DEFINITIONS_MD = f"""
 ### 口径版本：{DEFINITIONS_VERSION}

@@ -4,8 +4,8 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from datetime import date
-# from io import BytesIO
+from datetime import date, datetime
+from io import BytesIO
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -56,23 +56,45 @@ ACTIVE_SNAPSHOT_ID = get_active_snapshot_id(DB_PATH)
 # Helpers
 # ============================================================
 def _norm_date_series(s: pd.Series) -> pd.Series:
+    """
+    更稳地解析日期列：
+    1. datetime 类型直接标准化
+    2. 字符串日期正常解析
+    3. 对纯数字优先按 Excel 序列日期解析（1899-12-30 起）
+    """
+    if s is None or len(s) == 0:
+        return pd.to_datetime(s, errors="coerce")
+
+    # 已经是 datetime
     if pd.api.types.is_datetime64_any_dtype(s):
-        return pd.to_datetime(s).dt.normalize()
-
-    out = pd.to_datetime(s, errors="coerce")
-    if out.notna().any():
-        return out.dt.normalize()
-
-    try:
-        num = pd.to_numeric(s, errors="coerce")
-        out2 = pd.to_datetime("1899-12-30") + pd.to_timedelta(
-            num.fillna(-1).astype("int64"), unit="D"
-        )
-        out2 = out2.where(num.notna(), pd.NaT)
-        return out2.dt.normalize()
-    except Exception:
         return pd.to_datetime(s, errors="coerce").dt.normalize()
 
+    # 先尝试把“像数字的值”识别出来
+    num = pd.to_numeric(s, errors="coerce")
+
+    # 如果有相当一部分是数字，优先按 Excel 日期序列处理
+    if num.notna().mean() > 0.5:
+        out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+
+        # 常见 Excel 日期序列号一般大于 20000
+        excel_mask = num.notna() & (num >= 20000) & (num <= 60000)
+        if excel_mask.any():
+            out.loc[excel_mask] = (
+                pd.Timestamp("1899-12-30")
+                + pd.to_timedelta(num.loc[excel_mask], unit="D")
+            ).values
+
+        # 其余再按普通日期字符串解析
+        other_mask = ~excel_mask
+        if other_mask.any():
+            out.loc[other_mask] = pd.to_datetime(
+                s.loc[other_mask], errors="coerce"
+            ).values
+
+        return pd.to_datetime(out, errors="coerce").dt.normalize()
+
+    # 普通文本日期
+    return pd.to_datetime(s, errors="coerce").dt.normalize()
 
 def _to_dt(s: pd.Series) -> pd.Series:
     if pd.api.types.is_datetime64_any_dtype(s):
@@ -168,28 +190,48 @@ def _infer_system_from_eid(eid: str) -> str:
         return "车辆"
     return "其他"
 
-
 def _parse_duration_to_hours(x) -> float:
     """
-    把常见停机时长写法统一转成小时。
+    只把“时长值”解析成小时。
     支持：
-    - 2
-    - 2.5
-    - 2小时
-    - 2.5小时
+    - 2 / 2.5
+    - 2小时 / 2.5小时
     - 120分钟
     - 1小时30分
     - 1h / 1.5h
+    - 0:30 / 1:20 / 02:15:00
+    - Excel time / timedelta
     """
     if pd.isna(x):
         return np.nan
 
+    if isinstance(x, pd.Timedelta):
+        return x.total_seconds() / 3600.0
+
+    if isinstance(x, datetime):
+        return x.hour + x.minute / 60.0 + x.second / 3600.0
+
+    if isinstance(x, pd.Timestamp):
+        return x.hour + x.minute / 60.0 + x.second / 3600.0
+
     if isinstance(x, (int, float, np.number)):
-        return float(x)
+        v = float(x)
+        # Excel 里纯时间常常按“天的小数”存储，1小时=1/24
+        if 0 <= v < 1:
+            return v * 24.0
+        return v
 
     s = str(x).strip()
     if not s:
         return np.nan
+
+    # HH:MM 或 HH:MM:SS
+    m = re.match(r"^(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$", s)
+    if m:
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+        ss = int(m.group(3) or 0)
+        return hh + mm / 60.0 + ss / 3600.0
 
     try:
         return float(s)
@@ -204,6 +246,10 @@ def _parse_duration_to_hours(x) -> float:
             hours += float(m2.group(1)) / 60.0
         return hours
 
+    m = re.search(r"(\d+)\s*小时\s*(\d+)\s*分", s)
+    if m:
+        return float(m.group(1)) + float(m.group(2)) / 60.0
+
     m = re.search(r"(\d+(?:\.\d+)?)\s*h(?:ours?)?$", s, re.I)
     if m:
         return float(m.group(1))
@@ -216,11 +262,8 @@ def _parse_duration_to_hours(x) -> float:
     if m:
         return float(m.group(1)) / 60.0
 
-    m = re.search(r"(\d+)\s*小时\s*(\d+)\s*分", s)
-    if m:
-        return float(m.group(1)) + float(m.group(2)) / 60.0
-
     return np.nan
+
 
 
 # ============================================================
@@ -267,10 +310,10 @@ def _normalize_equipment_df(df: pd.DataFrame, default_system: str) -> pd.DataFra
 
 def _calc_downtime_hours(df: pd.DataFrame) -> pd.Series:
     """
-    更稳的停机时长计算逻辑：
-    1. 优先使用现成的时长字段，并支持“2小时/120分钟/1h/1小时30分”等格式
-    2. 若无现成字段，再尝试用开始/结束时间差计算
-    3. 算不出来返回 NaN，而不是 0
+    停机时长口径：
+    - 只读取“异常记录”sheet里的现成时长列（如 I 列：停机时长（小时））
+    - 不再使用开始/结束时间反算
+    - 是否纳入统计由外层再结合“是否停机=是”判断
     """
     if df is None or df.empty:
         return pd.Series(dtype="float64")
@@ -282,14 +325,6 @@ def _calc_downtime_hours(df: pd.DataFrame) -> pd.Series:
         "停机时长(小时)",
         "停机时长",
         "停机小时",
-        "停机时长（h）",
-        "时长（小时）",
-        "时长(小时)",
-        "时长",
-        "维修时长",
-        "duration_hours",
-        "downtime_hours",
-        "duration",
     ]
 
     existing_duration_cols = [c for c in duration_candidates if c in df.columns]
@@ -297,26 +332,7 @@ def _calc_downtime_hours(df: pd.DataFrame) -> pd.Series:
         parsed = df[col].apply(_parse_duration_to_hours)
         out = out.fillna(parsed)
 
-    start_col = None
-    end_col = None
-    for c in ["故障开始时间", "开始时间", "停机开始时间"]:
-        if c in df.columns:
-            start_col = c
-            break
-    for c in ["故障结束时间", "结束时间", "停机结束时间"]:
-        if c in df.columns:
-            end_col = c
-            break
-
-    if start_col and end_col and "日期" in df.columns:
-        start_dt = _to_dt_with_date(df["日期"], df[start_col])
-        end_dt = _to_dt_with_date(df["日期"], df[end_col])
-        delta = (end_dt - start_dt).dt.total_seconds() / 3600.0
-        delta = delta.where((delta >= 0) & (delta <= 24 * 30), np.nan)
-        out = out.fillna(delta)
-
     return out
-
 
 def _normalize_fault_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -371,6 +387,9 @@ def _normalize_fault_df(df: pd.DataFrame) -> pd.DataFrame:
         df["_end_dt"] = pd.NaT
 
     df["停机小时"] = _calc_downtime_hours(df)
+
+    stop_mask = df["是否停机"].astype(str).str.strip().eq("是")
+    df["停机统计有效"] = stop_mask & df["停机小时"].notna()
 
     return df
 
@@ -738,7 +757,6 @@ if p:
 else:
     equip, faults = pd.DataFrame(), pd.DataFrame()
 
-
 # ------------------------------------------------------------
 # If no data
 # ------------------------------------------------------------
@@ -756,18 +774,32 @@ if equip.empty and faults.empty:
 if not faults.empty and "日期" in faults.columns:
     sidebar_df = faults[["日期"]].rename(columns={"日期": "date"}).copy()
 else:
-    sidebar_df = pd.DataFrame({"date": [pd.Timestamp.today().normalize()]})
+    # faults 为空时，尽量不要把日期锁死在今天
+    # 用一个可显示的占位范围，避免 sidebar 看起来“坏了”
+    fallback_date = pd.Timestamp.today().normalize() - pd.Timedelta(days=30)
+    sidebar_df = pd.DataFrame({"date": [fallback_date, pd.Timestamp.today().normalize()]})
+
 
 start_date, end_date, date_meta = render_global_sidebar_by_df(sidebar_df, date_col="date")
 st.caption(f"当前筛选区间：{date_meta['label']}")
 
 st.sidebar.divider()
 show_raw = st.sidebar.checkbox("显示原始明细表", value=False, key="dev_show_raw")
-system_opts = sorted(faults["系统"].dropna().unique().tolist()) if (not faults.empty and "系统" in faults.columns) else []
+system_opts = (
+    sorted(faults["系统"].dropna().astype(str).unique().tolist())
+    if (not faults.empty and "系统" in faults.columns)
+    else []
+)
+
+prev_selected = st.session_state.get("dev_system_filter", system_opts)
+valid_selected = [x for x in prev_selected if x in system_opts]
+if not valid_selected:
+    valid_selected = system_opts
+
 system_filter = st.sidebar.multiselect(
     "系统筛选（用于统计/明细）",
     options=system_opts,
-    default=system_opts,
+    default=valid_selected,
     key="dev_system_filter",
 )
 
@@ -777,9 +809,16 @@ system_filter = st.sidebar.multiselect(
 # ------------------------------------------------------------
 faults_in_range = pd.DataFrame()
 if not faults.empty and "日期" in faults.columns:
-    f = faults[(faults["日期"].dt.date >= start_date) & (faults["日期"].dt.date <= end_date)].copy()
-    if system_filter and "系统" in f.columns:
-        f = f[f["系统"].isin(system_filter)].copy()
+    f = faults[
+        (faults["日期"].dt.date >= start_date) &
+        (faults["日期"].dt.date <= end_date)
+    ].copy()
+
+    if "系统" in f.columns:
+        valid_filter = [x for x in system_filter if x in set(f["系统"].dropna().astype(str))]
+        if valid_filter:
+            f = f[f["系统"].isin(valid_filter)].copy()
+
     faults_in_range = f
 
 
@@ -1072,12 +1111,12 @@ else:
     total_events = int(len(dff))
     unique_devices = int(dff["设备id"].nunique()) if "设备id" in dff.columns else 0
 
-    stop_mask = (
-        dff["是否停机"].astype(str).str.contains("是", na=False)
-        if "是否停机" in dff.columns
-        else pd.Series([False] * len(dff), index=dff.index)
+    valid_stop_mask = (
+    dff["停机统计有效"].fillna(False)
+    if "停机统计有效" in dff.columns
+    else pd.Series([False] * len(dff), index=dff.index)
     )
-    stop_df = dff[stop_mask].copy()
+    stop_df = dff[valid_stop_mask].copy()
 
     downtime_hours_sum = (
         float(pd.to_numeric(stop_df["停机小时"], errors="coerce").dropna().sum())
@@ -1085,8 +1124,15 @@ else:
         else 0.0
     )
 
-    if len(stop_df) > 0 and "停机小时" in stop_df.columns:
-        completeness = float(pd.to_numeric(stop_df["停机小时"], errors="coerce").notna().mean())
+    all_stop_mask = (
+        dff["是否停机"].astype(str).str.strip().eq("是")
+        if "是否停机" in dff.columns
+        else pd.Series([False] * len(dff), index=dff.index)
+    )
+    all_stop_df = dff[all_stop_mask].copy()
+
+    if len(all_stop_df) > 0 and "停机小时" in all_stop_df.columns:
+        completeness = float(pd.to_numeric(all_stop_df["停机小时"], errors="coerce").notna().mean())
     else:
         completeness = 0.0
 
@@ -1115,11 +1161,17 @@ else:
 
     st.divider()
 
+    dff["有效停机小时"] = np.where(
+    dff.get("停机统计有效", False),
+    pd.to_numeric(dff["停机小时"], errors="coerce"),
+    np.nan,
+)
+
     grp = (
         dff.groupby(["设备id", "设备名称", "系统"], dropna=False)
         .agg(
             异常次数=("日期", "count"),
-            停机总时长小时=("停机小时", lambda x: float(pd.to_numeric(x, errors="coerce").dropna().sum())),
+            停机总时长小时=("有效停机小时", lambda x: float(pd.to_numeric(x, errors="coerce").dropna().sum())),
             最近一次异常=("日期", "max"),
         )
         .reset_index()

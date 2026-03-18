@@ -14,6 +14,7 @@ def prepare_ops_metrics(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     out = df.copy()
+
     if "date" in out.columns:
         out["date"] = pd.to_datetime(out["date"], errors="coerce")
         out = out[out["date"].notna()].sort_values("date").copy()
@@ -24,7 +25,9 @@ def prepare_ops_metrics(df: pd.DataFrame) -> pd.DataFrame:
     if "slag_total_ton" not in out.columns and "slag_ton" in out.columns:
         out["slag_total_ton"] = out["slag_ton"]
 
+    # 统一补列，避免后续计算报错
     for col in [
+        "incoming_ton",
         "incoming_bucket_count",
         "line1_feed_bucket_count",
         "line1_slag_bucket_count",
@@ -32,12 +35,36 @@ def prepare_ops_metrics(df: pd.DataFrame) -> pd.DataFrame:
         "line2_slag_bucket_count",
         "compress_bucket_count",
         "centrifuge_feed_m3",
+        "slurry_m3",
+        "water_m3",
         "line1_runtime_hours",
         "line2_runtime_hours",
     ]:
         if col not in out.columns:
             out[col] = np.nan
 
+    # 统一数值化
+    numeric_cols = [
+        "incoming_ton",
+        "slag_total_ton",
+        "incoming_bucket_count",
+        "line1_feed_bucket_count",
+        "line1_slag_bucket_count",
+        "line2_feed_bucket_count",
+        "line2_slag_bucket_count",
+        "compress_bucket_count",
+        "centrifuge_feed_m3",
+        "slurry_m3",
+        "water_m3",
+        "daily_elec_kwh",
+        "line1_runtime_hours",
+        "line2_runtime_hours",
+    ]
+    for col in numeric_cols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    # 桶转吨
     out["incoming_bucket_ton"] = out["incoming_bucket_count"] * bucket_to_ton
     out["line1_feed_bucket_ton"] = out["line1_feed_bucket_count"] * bucket_to_ton
     out["line1_slag_bucket_ton"] = out["line1_slag_bucket_count"] * bucket_to_ton
@@ -46,48 +73,45 @@ def prepare_ops_metrics(df: pd.DataFrame) -> pd.DataFrame:
     out["compress_bucket_ton"] = out["compress_bucket_count"] * bucket_to_ton
 
     # 出渣率
-    incoming = out["incoming_ton"] if "incoming_ton" in out.columns else np.nan
-    slag_total = out["slag_total_ton"] if "slag_total_ton" in out.columns else np.nan
     out["slag_rate"] = np.where(
-        pd.to_numeric(incoming, errors="coerce").fillna(0) > 0,
-        pd.to_numeric(slag_total, errors="coerce") / pd.to_numeric(incoming, errors="coerce"),
+        out["incoming_ton"].fillna(0) > 0,
+        out["slag_total_ton"] / out["incoming_ton"],
         np.nan,
     )
 
     # 单吨水耗
-    if "water_m3" in out.columns and "incoming_ton" in out.columns:
-        out["water_per_ton"] = np.where(
-            out["incoming_ton"].fillna(0) > 0,
-            out["water_m3"] / out["incoming_ton"],
-            np.nan,
-        )
-    else:
-        out["water_per_ton"] = np.nan
+    out["water_per_ton"] = np.where(
+        out["incoming_ton"].fillna(0) > 0,
+        out["water_m3"] / out["incoming_ton"],
+        np.nan,
+    )
 
     # 单吨电耗
-    if "daily_elec_kwh" in out.columns and "incoming_ton" in out.columns:
-        out["elec_per_ton"] = np.where(
-            out["incoming_ton"].fillna(0) > 0,
-            out["daily_elec_kwh"] / out["incoming_ton"],
-            np.nan,
-        )
-    else:
-        out["elec_per_ton"] = np.nan
+    out["elec_per_ton"] = np.where(
+        out["incoming_ton"].fillna(0) > 0,
+        out["daily_elec_kwh"] / out["incoming_ton"],
+        np.nan,
+    )
 
-    # 真实浆料产出相关
-    out["actual_slurry_m3"] = out["centrifuge_feed_m3"].where(out["centrifuge_feed_m3"].fillna(0) > 0, out.get("slurry_m3", np.nan))
+    # 真实浆料优先用离心机进料量，没有则退回制浆量
+    out["actual_slurry_m3"] = out["centrifuge_feed_m3"].where(
+        out["centrifuge_feed_m3"].fillna(0) > 0,
+        out["slurry_m3"],
+    )
+
     out["slurry_per_ton"] = np.where(
         out["incoming_ton"].fillna(0) > 0,
         out["actual_slurry_m3"] / out["incoming_ton"],
         np.nan,
     )
+
     out["slurry_per_bucket"] = np.where(
         out["incoming_bucket_count"].fillna(0) > 0,
         out["actual_slurry_m3"] / out["incoming_bucket_count"],
         np.nan,
     )
 
-    # 双线效率
+    # 双线效率：吨/小时、桶/小时
     out["line1_feed_tph"] = np.where(
         out["line1_runtime_hours"].fillna(0) > 0,
         out["line1_feed_bucket_ton"] / out["line1_runtime_hours"],
@@ -98,6 +122,7 @@ def prepare_ops_metrics(df: pd.DataFrame) -> pd.DataFrame:
         out["line2_feed_bucket_ton"] / out["line2_runtime_hours"],
         np.nan,
     )
+
     out["line1_feed_bucket_per_hour"] = np.where(
         out["line1_runtime_hours"].fillna(0) > 0,
         out["line1_feed_bucket_count"] / out["line1_runtime_hours"],
@@ -108,6 +133,8 @@ def prepare_ops_metrics(df: pd.DataFrame) -> pd.DataFrame:
         out["line2_feed_bucket_count"] / out["line2_runtime_hours"],
         np.nan,
     )
+
+    # 双线出渣比例（按桶）
     out["line1_slag_rate_by_bucket"] = np.where(
         out["line1_feed_bucket_count"].fillna(0) > 0,
         out["line1_slag_bucket_count"] / out["line1_feed_bucket_count"],
@@ -116,6 +143,18 @@ def prepare_ops_metrics(df: pd.DataFrame) -> pd.DataFrame:
     out["line2_slag_rate_by_bucket"] = np.where(
         out["line2_feed_bucket_count"].fillna(0) > 0,
         out["line2_slag_bucket_count"] / out["line2_feed_bucket_count"],
+        np.nan,
+    )
+
+    # 开机利用率（按 24h）
+    out["line1_runtime_utilization"] = np.where(
+        out["line1_runtime_hours"].fillna(0) > 0,
+        out["line1_runtime_hours"] / 24.0,
+        np.nan,
+    )
+    out["line2_runtime_utilization"] = np.where(
+        out["line2_runtime_hours"].fillna(0) > 0,
+        out["line2_runtime_hours"] / 24.0,
         np.nan,
     )
 
@@ -150,6 +189,8 @@ def summarize_ops_period(df: pd.DataFrame) -> dict:
             "avg_slurry_per_ton": np.nan,
             "line1_feed_bucket_count": 0.0,
             "line2_feed_bucket_count": 0.0,
+            "line1_runtime_hours": 0.0,
+            "line2_runtime_hours": 0.0,
             "line1_avg_tph": np.nan,
             "line2_avg_tph": np.nan,
         }
@@ -160,10 +201,13 @@ def summarize_ops_period(df: pd.DataFrame) -> dict:
     elec_kwh = float(df["daily_elec_kwh"].sum(skipna=True)) if "daily_elec_kwh" in df.columns else 0.0
     incoming_bucket_count = float(df["incoming_bucket_count"].sum(skipna=True)) if "incoming_bucket_count" in df.columns else 0.0
     actual_slurry_m3 = float(df["actual_slurry_m3"].sum(skipna=True)) if "actual_slurry_m3" in df.columns else 0.0
+
     line1_feed_bucket_count = float(df["line1_feed_bucket_count"].sum(skipna=True)) if "line1_feed_bucket_count" in df.columns else 0.0
     line2_feed_bucket_count = float(df["line2_feed_bucket_count"].sum(skipna=True)) if "line2_feed_bucket_count" in df.columns else 0.0
+
     line1_feed_ton = float(df["line1_feed_bucket_ton"].sum(skipna=True)) if "line1_feed_bucket_ton" in df.columns else 0.0
     line2_feed_ton = float(df["line2_feed_bucket_ton"].sum(skipna=True)) if "line2_feed_bucket_ton" in df.columns else 0.0
+
     line1_runtime_hours = float(df["line1_runtime_hours"].sum(skipna=True)) if "line1_runtime_hours" in df.columns else 0.0
     line2_runtime_hours = float(df["line2_runtime_hours"].sum(skipna=True)) if "line2_runtime_hours" in df.columns else 0.0
 
@@ -182,6 +226,8 @@ def summarize_ops_period(df: pd.DataFrame) -> dict:
         "avg_slurry_per_ton": safe_div(actual_slurry_m3, incoming_ton),
         "line1_feed_bucket_count": line1_feed_bucket_count,
         "line2_feed_bucket_count": line2_feed_bucket_count,
+        "line1_runtime_hours": line1_runtime_hours,
+        "line2_runtime_hours": line2_runtime_hours,
         "line1_avg_tph": safe_div(line1_feed_ton, line1_runtime_hours),
         "line2_avg_tph": safe_div(line2_feed_ton, line2_runtime_hours),
     }
@@ -241,7 +287,8 @@ def build_monthly_ops_summary(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     out = df.copy()
-    out["month"] = pd.to_datetime(out["date"]).dt.to_period("M").astype(str)
+    out["month"] = pd.to_datetime(out["date"], errors="coerce").dt.to_period("M").astype(str)
+
     grouped = (
         out.groupby("month", dropna=False)
         .agg(
@@ -260,11 +307,15 @@ def build_monthly_ops_summary(df: pd.DataFrame) -> pd.DataFrame:
         )
         .reset_index()
     )
+
     grouped["slag_rate"] = grouped.apply(lambda r: safe_div(r["slag_total_ton"], r["incoming_ton"]), axis=1)
     grouped["water_per_ton"] = grouped.apply(lambda r: safe_div(r["water_m3"], r["incoming_ton"]), axis=1)
     grouped["elec_per_ton"] = grouped.apply(lambda r: safe_div(r["daily_elec_kwh"], r["incoming_ton"]), axis=1)
     grouped["slurry_per_ton"] = grouped.apply(lambda r: safe_div(r["actual_slurry_m3"], r["incoming_ton"]), axis=1)
     grouped["line1_feed_tph"] = grouped.apply(lambda r: safe_div(r["line1_feed_bucket_ton"], r["line1_runtime_hours"]), axis=1)
     grouped["line2_feed_tph"] = grouped.apply(lambda r: safe_div(r["line2_feed_bucket_ton"], r["line2_runtime_hours"]), axis=1)
+    grouped["line1_runtime_utilization"] = grouped["line1_runtime_hours"] / (24 * 30)
+    grouped["line2_runtime_utilization"] = grouped["line2_runtime_hours"] / (24 * 30)
     grouped["month_label"] = pd.to_datetime(grouped["month"] + "-01").dt.strftime("%y-%m")
+
     return grouped
