@@ -14,7 +14,13 @@ st.set_page_config(page_title="总览 | 海吉星果蔬项目", layout="wide")
 
 from utils.bootstrap import bootstrap_page
 from utils.config import get_bucket_to_ton
-from utils.cost_store import build_cost_dashboard_dataset
+from utils.cost_analytics import (
+    load_cost_detail_data,
+    build_monthly_cost_summary,
+    build_month_total_cost,
+    attach_monthly_ton_cost,
+)
+from utils.ops_analysis import prepare_ops_metrics, build_monthly_ops_summary
 from utils.data_access import (
     add_daily_electricity,
     load_daily_ops_data,
@@ -73,31 +79,49 @@ def month_range(df: pd.DataFrame, target_period: pd.Period):
     mask = df["date"].dt.to_period("M") == target_period
     return df.loc[mask].copy()
 
-
 @st.cache_data(ttl=60)
-def get_prev_month_cost_kpi(db_path: str):
-    data = build_cost_dashboard_dataset(db_path)
-    monthly = data["monthly_with_ops"]
-
-    if monthly.empty:
+def get_current_month_cost_kpi(db_path: str, snapshot_id: str, ref_date: pd.Timestamp):
+    # 1. 成本明细：走成本分析页同一套逻辑
+    cost_df = load_cost_detail_data(db_path)
+    if cost_df is None or cost_df.empty:
         return None
 
-    monthly = monthly.copy()
-    monthly["analysis_month"] = monthly["analysis_month"].astype(str)
-    monthly = monthly.sort_values("analysis_month")
+    monthly_cost_df = build_monthly_cost_summary(cost_df)
+    month_total_cost_df = build_month_total_cost(monthly_cost_df)
 
-    prev_month = (pd.Timestamp.today().to_period("M") - 1).strftime("%Y-%m")
-    hit = monthly[monthly["analysis_month"] == prev_month]
+    # 2. 运营月汇总：也走成本分析页同一套逻辑
+    ops_raw = load_daily_ops_data(db_path, snapshot_id=snapshot_id)
+    if ops_raw is None or ops_raw.empty:
+        return None
 
-    row = hit.iloc[-1] if not hit.empty else monthly.iloc[-1]
+    ops_metrics = prepare_ops_metrics(ops_raw)
+    if ops_metrics.empty:
+        return None
+
+    monthly_ops_df = build_monthly_ops_summary(ops_metrics)
+
+    # 3. 关联吨成本
+    month_cost_with_ton_df = attach_monthly_ton_cost(month_total_cost_df, monthly_ops_df)
+    if month_cost_with_ton_df is None or month_cost_with_ton_df.empty:
+        return None
+
+    month_cost_with_ton_df = month_cost_with_ton_df.copy()
+    month_cost_with_ton_df["analysis_month"] = month_cost_with_ton_df["analysis_month"].astype(str)
+
+    current_month = ref_date.to_period("M").strftime("%Y-%m")
+    hit = month_cost_with_ton_df[month_cost_with_ton_df["analysis_month"] == current_month]
+
+    if hit.empty:
+        return None
+
+    row = hit.iloc[-1]
 
     return {
         "month": row["analysis_month"],
-        "total_cost": row["total_cost"],
-        "ton_cost": row["ton_cost"],
-        "incoming_ton": row["incoming_ton"],
+        "total_cost": row["amount"] if "amount" in row else np.nan,
+        "ton_cost": row["cost_per_ton"] if "cost_per_ton" in row else np.nan,
+        "incoming_ton": row["incoming_ton"] if "incoming_ton" in row else np.nan,
     }
-
 
 def _sum_col(df: pd.DataFrame, col: str) -> float:
     if col not in df.columns:
@@ -303,7 +327,7 @@ with st.expander("📌 口径说明", expanded=False):
 
 latest_kpi = get_latest_ops_kpis(DB_PATH)
 device_info = get_home_device_status(DB_PATH)
-cost_kpi = get_prev_month_cost_kpi(DB_PATH)
+cost_kpi = get_current_month_cost_kpi(DB_PATH, ACTIVE_SNAPSHOT_ID, pd.Timestamp(end_date))
 
 _render_status_banner(dfr, start_date, end_date)
 
@@ -325,10 +349,44 @@ st.subheader("核心指标")
 
 k1, k2, k3, k4, k5, k6 = st.columns(6)
 
-recent_incoming = latest_kpi["incoming_ton"] if latest_kpi else np.nan
-recent_slurry = latest_kpi.get("centrifuge_feed_m3", np.nan) if latest_kpi else np.nan
-recent_slag_rate = latest_kpi["slag_ratio"] if latest_kpi else np.nan
-recent_date = latest_kpi["date"] if latest_kpi else None
+# recent_incoming = latest_kpi["incoming_ton"] if latest_kpi else np.nan
+# recent_slurry = latest_kpi.get("centrifuge_feed_m3", np.nan) if latest_kpi else np.nan
+# recent_slag_rate = latest_kpi["slag_ratio"] if latest_kpi else np.nan
+# recent_date = latest_kpi["date"] if latest_kpi else None
+
+tmp = dfr.copy()
+
+# 保证字段存在
+for col in ["incoming_ton", "centrifuge_feed_m3", "slag_total_ton"]:
+    if col not in tmp.columns:
+        tmp[col] = np.nan
+
+# 计算出渣率（避免依赖 latest_kpi）
+tmp["slag_rate_calc"] = np.where(
+    tmp["incoming_ton"].fillna(0) > 0,
+    tmp["slag_total_ton"] / tmp["incoming_ton"],
+    np.nan,
+)
+
+# 👉 找最近一条“三个都有值”的记录
+tmp_valid = tmp[
+    tmp["incoming_ton"].notna()
+    & tmp["centrifuge_feed_m3"].notna()
+    & tmp["slag_rate_calc"].notna()
+].copy()
+
+if not tmp_valid.empty:
+    latest_row = tmp_valid.sort_values("date").iloc[-1]
+
+    recent_incoming = latest_row["incoming_ton"]
+    recent_slurry = latest_row["centrifuge_feed_m3"]
+    recent_slag_rate = latest_row["slag_rate_calc"]
+    recent_date = latest_row["date"]
+else:
+    recent_incoming = np.nan
+    recent_slurry = np.nan
+    recent_slag_rate = np.nan
+    recent_date = None
 
 k1.metric("最近处理量", "-" if pd.isna(recent_incoming) else f"{recent_incoming:,.1f} 吨")
 k2.metric("最近真实浆料", "-" if pd.isna(recent_slurry) else f"{recent_slurry:,.1f} m³")
@@ -339,14 +397,20 @@ k5.metric(
     recent_date.strftime("%Y-%m-%d") if recent_date is not None and pd.notna(recent_date) else "-",
 )
 k6.metric(
-    "上月吨均成本",
+    "当前月吨均成本",
     "-"
     if not cost_kpi or pd.isna(cost_kpi["ton_cost"])
     else f"{cost_kpi['ton_cost']:.1f} 元/吨",
 )
 
 st.caption(f"设备状态说明：{device_info['detail']}")
-st.caption(f"数据新鲜度：{freshness_text}")
+if recent_date is not None:
+    st.caption(
+        f"最近完整数据：{recent_date.strftime('%Y-%m-%d')} ｜ 数据新鲜度：{freshness_text}"
+    )
+else:
+    st.caption(f"数据新鲜度：{freshness_text}")
+# st.caption(f"数据新鲜度：{freshness_text}")
 
 # # ========= 第二行 KPI =========
 # q1, q2, q3, q4, q5, q6 = st.columns(6)
