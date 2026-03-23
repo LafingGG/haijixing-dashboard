@@ -426,50 +426,78 @@ if len(alerts) > 0:
     for item in alerts:
         st.warning(item)
 
-# ========= 主视图 1：近7天处理量 / 真实浆料 =========
+# ========= 主视图 1：近7天处理量（桶） =========
 st.subheader("近 7 天核心趋势")
 
 recent = df.copy()
+
 valid_mask = (
-    recent["incoming_ton"].fillna(0) > 0
+    recent.get("line1_feed_bucket_count", pd.Series(index=recent.index)).fillna(0) > 0
 ) | (
-    recent.get("slag_total_ton", pd.Series(index=recent.index, dtype=float)).fillna(0) > 0
-) | (
-    recent.get("incoming_bucket_count", pd.Series(index=recent.index, dtype=float)).fillna(0) > 0
-) | (
-    recent.get("centrifuge_feed_m3", pd.Series(index=recent.index, dtype=float)).fillna(0) > 0
+    recent.get("line2_feed_bucket_count", pd.Series(index=recent.index)).fillna(0) > 0
 )
+
 recent = recent.loc[valid_mask].copy().tail(7)
 
 if recent.empty:
     st.info("暂无近 7 天趋势数据。")
 else:
+    recent["date_str"] = recent["date"].dt.strftime("%Y-%m-%d")
+
+    # 防止缺列
+    recent["line1_feed_bucket_count"] = pd.to_numeric(
+        recent.get("line1_feed_bucket_count"), errors="coerce"
+    ).fillna(0)
+
+    recent["line2_feed_bucket_count"] = pd.to_numeric(
+        recent.get("line2_feed_bucket_count"), errors="coerce"
+    ).fillna(0)
+
     fig = go.Figure()
+
+    # ✅ 堆叠柱：1线 + 2线
     fig.add_bar(
-        x=recent["date"].dt.strftime("%Y-%m-%d"),
-        y=recent["incoming_ton"],
-        name="处理量（吨）",
+        x=recent["date_str"],
+        y=recent["line1_feed_bucket_count"],
+        name="1线",
     )
+
+    fig.add_bar(
+        x=recent["date_str"],
+        y=recent["line2_feed_bucket_count"],
+        name="2线",
+    )
+
+    # 可选：保留浆料（右轴）
     if "centrifuge_feed_m3" in recent.columns:
         fig.add_scatter(
-            x=recent["date"].dt.strftime("%Y-%m-%d"),
+            x=recent["date_str"],
             y=recent["centrifuge_feed_m3"],
             mode="lines+markers",
             name="真实浆料（m³）",
             yaxis="y2",
         )
+
     fig.update_layout(
+        barmode="stack",  # ⭐关键：堆叠
         height=400,
         margin=dict(l=10, r=10, t=40, b=10),
         xaxis=dict(title="日期"),
-        yaxis=dict(title="处理量（吨）"),
+        yaxis=dict(title="处理量（桶）"),
         yaxis2=dict(
             title="真实浆料（m³）",
             overlaying="y",
             side="right",
         ),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+        ),
     )
+
     st.plotly_chart(fig, use_container_width=True)
 
 # ========= 主视图 2：双线处理 / 出渣对比 =========
